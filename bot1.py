@@ -363,74 +363,101 @@ async def on_business_message(message: Message):
     connection_id = message.business_connection_id
     await save_message(message, connection_id)
 
-    # Сохранение одноразовых медиа
-    if not (message.reply_to_message and message.from_user and connection_id):
+    if not connection_id:
         return
 
-    owner_id = await get_owner_id(connection_id)
-    if not owner_id or message.from_user.id != owner_id:
+    owner_id = await get_user_by_connection(connection_id)
+    if not owner_id:
         return
 
-    replied = message.reply_to_message
-    media_type = file_id = None
+    # Сохраняем только защищённые (скрытые / view-once) медиа
+    if not message.has_protected_content:
+        return
 
-    if replied.photo:
-        media_type, file_id = "photo", replied.photo[-1].file_id
-    elif replied.video:
-        media_type, file_id = "video", replied.video.file_id
-    elif replied.video_note:
-        media_type, file_id = "video_note", replied.video_note.file_id
-    elif replied.voice:
-        media_type, file_id = "voice", replied.voice.file_id
-    elif replied.document:
-        media_type, file_id = "document", replied.document.file_id
-    elif replied.animation:
-        media_type, file_id = "animation", replied.animation.file_id
+    media_type = None
+    file_id = None
+
+    if message.photo:
+        media_type = "photo"
+        file_id = message.photo[-1].file_id
+    elif message.video:
+        media_type = "video"
+        file_id = message.video.file_id
+    elif message.video_note:
+        media_type = "video_note"
+        file_id = message.video_note.file_id
+    elif message.voice:
+        media_type = "voice"
+        file_id = message.voice.file_id
+    elif message.document:
+        media_type = "document"
+        file_id = message.document.file_id
+    elif message.animation:
+        media_type = "animation"
+        file_id = message.animation.file_id
+    elif message.sticker:
+        media_type = "sticker"
+        file_id = message.sticker.file_id
 
     if not file_id:
         return
 
     try:
         file = await bot.get_file(file_id)
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
 
         async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
+            async with session.get(file_url) as resp:
                 if resp.status != 200:
+                    await bot.send_message(owner_id, "❌ Не удалось скачать защищённое медиа")
                     return
+
                 content = await resp.read()
 
-        ext = {
-            "photo": ".jpg", "video": ".mp4", "video_note": ".mp4",
-            "animation": ".mp4", "voice": ".ogg"
-        }.get(media_type, ".bin")
+                ext = {
+                    "photo": ".jpg",
+                    "video": ".mp4",
+                    "animation": ".mp4",
+                    "video_note": ".mp4",
+                    "voice": ".ogg",
+                    "sticker": ".webp",
+                }.get(media_type, ".bin")
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
+                temp_filename = f"temp_{message.message_id}{ext}"
+                with open(temp_filename, "wb") as f:
+                    f.write(content)
 
-        input_file = FSInputFile(tmp_path)
-        caption = f"💾 <b>Сохранено одноразовое медиа</b>\nОт: {replied.from_user.full_name if replied.from_user else 'неизвестно'}"
+                input_file = FSInputFile(temp_filename)
+                caption = (
+                    f"💾 <b>Сохранено скрытое медиа</b>\n"
+                    f"От: {message.from_user.full_name if message.from_user else 'неизвестно'}"
+                )
 
-        try:
-            if media_type == "photo":
-                await bot.send_photo(owner_id, input_file, caption=caption)
-            elif media_type == "video":
-                await bot.send_video(owner_id, input_file, caption=caption)
-            elif media_type == "voice":
-                await bot.send_voice(owner_id, input_file, caption=caption)
-            elif media_type == "document":
-                await bot.send_document(owner_id, input_file, caption=caption)
-            elif media_type == "animation":
-                await bot.send_animation(owner_id, input_file, caption=caption)
-            elif media_type == "video_note":
-                await bot.send_video_note(owner_id, input_file)
-                await bot.send_message(owner_id, caption)
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+                if media_type == "photo":
+                    await bot.send_photo(owner_id, input_file, caption=caption)
+                elif media_type == "video":
+                    await bot.send_video(owner_id, input_file, caption=caption)
+                elif media_type == "voice":
+                    await bot.send_voice(owner_id, input_file, caption=caption)
+                elif media_type == "document":
+                    await bot.send_document(owner_id, input_file, caption=caption)
+                elif media_type == "animation":
+                    await bot.send_animation(owner_id, input_file, caption=caption)
+                elif media_type == "video_note":
+                    await bot.send_video_note(owner_id, input_file)
+                    await bot.send_message(owner_id, caption)
+                elif media_type == "sticker":
+                    await bot.send_sticker(owner_id, input_file)
+                    await bot.send_message(owner_id, caption)
+
+                os.remove(temp_filename)
 
     except Exception as e:
-        logger.error(f"Ошибка сохранения одноразового медиа: {e}")
+        logger.error(f"Protected media save error: {e}")
+        try:
+            await bot.send_message(owner_id, f"❌ Ошибка сохранения: {e}")
+        except Exception:
+            pass
 
 @dp.edited_business_message()
 async def on_edited_business_message(message: Message):
