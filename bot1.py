@@ -363,41 +363,44 @@ async def on_business_message(message: Message):
     connection_id = message.business_connection_id
     await save_message(message, connection_id)
 
-    if not connection_id:
+    # Сохраняем медиа только если владелец ответил на чужое медиа
+    if not (message.reply_to_message and message.from_user and connection_id):
         return
 
     owner_id = await get_user_by_connection(connection_id)
-    if not owner_id:
+    if not owner_id or message.from_user.id != owner_id:
         return
 
-    # Сохраняем только защищённые (скрытые / view-once) медиа
-    if not message.has_protected_content:
+    replied = message.reply_to_message
+
+    # Не сохраняем свои же медиа
+    if replied.from_user and replied.from_user.id == owner_id:
         return
 
     media_type = None
     file_id = None
 
-    if message.photo:
+    if replied.photo:
         media_type = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.video:
+        file_id = replied.photo[-1].file_id
+    elif replied.video:
         media_type = "video"
-        file_id = message.video.file_id
-    elif message.video_note:
+        file_id = replied.video.file_id
+    elif replied.video_note:
         media_type = "video_note"
-        file_id = message.video_note.file_id
-    elif message.voice:
+        file_id = replied.video_note.file_id
+    elif replied.voice:
         media_type = "voice"
-        file_id = message.voice.file_id
-    elif message.document:
+        file_id = replied.voice.file_id
+    elif replied.document:
         media_type = "document"
-        file_id = message.document.file_id
-    elif message.animation:
+        file_id = replied.document.file_id
+    elif replied.animation:
         media_type = "animation"
-        file_id = message.animation.file_id
-    elif message.sticker:
+        file_id = replied.animation.file_id
+    elif replied.sticker:
         media_type = "sticker"
-        file_id = message.sticker.file_id
+        file_id = replied.sticker.file_id
 
     if not file_id:
         return
@@ -409,7 +412,7 @@ async def on_business_message(message: Message):
         async with aiohttp.ClientSession() as session:
             async with session.get(file_url) as resp:
                 if resp.status != 200:
-                    await bot.send_message(owner_id, "❌ Не удалось скачать защищённое медиа")
+                    await bot.send_message(owner_id, "❌ Не удалось скачать файл")
                     return
 
                 content = await resp.read()
@@ -429,8 +432,8 @@ async def on_business_message(message: Message):
 
                 input_file = FSInputFile(temp_filename)
                 caption = (
-                    f"💾 <b>Сохранено скрытое медиа</b>\n"
-                    f"От: {message.from_user.full_name if message.from_user else 'неизвестно'}"
+                    f"💾 <b>Сохранено</b>\n"
+                    f"От: {replied.from_user.full_name if replied.from_user else 'неизвестно'}"
                 )
 
                 if media_type == "photo":
@@ -453,9 +456,9 @@ async def on_business_message(message: Message):
                 os.remove(temp_filename)
 
     except Exception as e:
-        logger.error(f"Protected media save error: {e}")
+        logger.error(f"Save media error: {e}")
         try:
-            await bot.send_message(owner_id, f"❌ Ошибка сохранения: {e}")
+            await bot.send_message(owner_id, f"❌ Ошибка: {e}")
         except Exception:
             pass
 
