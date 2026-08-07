@@ -5,9 +5,12 @@ from datetime import datetime
 
 import aiosqlite
 import aiohttp
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, BusinessConnection, BusinessMessagesDeleted, FSInputFile
+from aiogram.types import (
+    Message, BusinessConnection, BusinessMessagesDeleted, FSInputFile,
+    CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -77,6 +80,15 @@ async def get_user_by_connection(connection_id: str) -> int | None:
             row = await cursor.fetchone()
             return row[0] if row else None
 
+async def get_user_connections(user_id: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT connection_id FROM connections WHERE user_id = ? AND is_enabled = 1",
+            (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
 async def save_message(message: Message, connection_id: str | None = None):
     text = message.text or message.caption or ""
     media_type = None
@@ -135,6 +147,46 @@ async def get_message(chat_id: int, message_id: int):
         ) as cursor:
             return await cursor.fetchone()
 
+async def get_chats_for_user(user_id: int) -> list[tuple]:
+    connections = await get_user_connections(user_id)
+    if not connections:
+        return []
+
+    placeholders = ",".join("?" * len(connections))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = f"""
+            SELECT 
+                chat_id,
+                from_user_name,
+                MAX(date) as last_date,
+                COUNT(*) as msg_count
+            FROM messages
+            WHERE connection_id IN ({placeholders})
+              AND from_user_id != ?
+            GROUP BY chat_id
+            ORDER BY last_date DESC
+        """
+        async with db.execute(query, (*connections, user_id)) as cursor:
+            return await cursor.fetchall()
+
+async def get_chat_history(chat_id: int, connection_ids: list[str], limit: int = 40) -> list[tuple]:
+    if not connection_ids:
+        return []
+
+    placeholders = ",".join("?" * len(connection_ids))
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        query = f"""
+            SELECT from_user_name, text, media_type, file_id, date
+            FROM messages
+            WHERE chat_id = ? AND connection_id IN ({placeholders})
+            ORDER BY date ASC
+            LIMIT ?
+        """
+        async with db.execute(query, (chat_id, *connection_ids, limit)) as cursor:
+            return await cursor.fetchall()
+
 # ==================== КОМАНДЫ ====================
 
 @dp.message(CommandStart())
@@ -152,7 +204,8 @@ async def cmd_start(message: Message):
         "• Удалённые сообщения\n"
         "• Отредактированные сообщения\n"
         "• Медиа, на которые ты ответишь (кроме своих)\n\n"
-        "Команды:\n"
+        "<b>Команды:</b>\n"
+        "/chats — список чатов и история\n"
         "/status — проверить подключение\n"
         "/myid — узнать свой ID"
     )
@@ -186,6 +239,84 @@ async def cmd_status(message: Message):
         text += f"• {status}\n  ID: <code>{conn_id}</code>\n  Дата: {date}\n\n"
 
     await message.answer(text)
+
+@dp.message(Command("chats"))
+async def cmd_chats(message: Message):
+    user_id = message.from_user.id
+    chats = await get_chats_for_user(user_id)
+
+    if not chats:
+        await message.answer("У тебя пока нет сохранённых переписок.")
+        return
+
+    buttons = []
+    for chat_id, name, last_date, msg_count in chats:
+        date_str = datetime.fromtimestamp(last_date).strftime("%d.%m %H:%M") if last_date else "—"
+        btn_text = f"{name} ({msg_count}) • {date_str}"
+        buttons.append([
+            InlineKeyboardButton(
+                text=btn_text[:64],
+                callback_data=f"history:{chat_id}"
+            )
+        ])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(
+        f"<b>Твои чаты</b> ({len(chats)}):\nВыбери чат, чтобы посмотреть историю:",
+        reply_markup=keyboard
+    )
+
+@dp.callback_query(F.data.startswith("history:"))
+async def show_history(callback: CallbackQuery):
+    await callback.answer()
+
+    try:
+        chat_id = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        await callback.message.answer("Ошибка данных.")
+        return
+
+    user_id = callback.from_user.id
+    connections = await get_user_connections(user_id)
+    history = await get_chat_history(chat_id, connections, limit=40)
+
+    if not history:
+        await callback.message.answer("История этого чата пуста.")
+        return
+
+    await callback.message.answer(f"📜 <b>История чата</b> (последние {len(history)} сообщений):")
+
+    for name, text, media_type, file_id, date in history:
+        time_str = datetime.fromtimestamp(date).strftime("%d.%m %H:%M") if date else ""
+        header = f"<b>{name}</b> <i>{time_str}</i>"
+
+        try:
+            if text:
+                await callback.message.answer(f"{header}\n{text}")
+            elif media_type and file_id:
+                caption = f"{header}\n[{media_type}]"
+                if media_type == "photo":
+                    await callback.message.answer_photo(file_id, caption=caption)
+                elif media_type == "video":
+                    await callback.message.answer_video(file_id, caption=caption)
+                elif media_type == "voice":
+                    await callback.message.answer_voice(file_id, caption=caption)
+                elif media_type == "document":
+                    await callback.message.answer_document(file_id, caption=caption)
+                elif media_type == "video_note":
+                    await callback.message.answer_video_note(file_id)
+                    await callback.message.answer(header)
+                elif media_type == "sticker":
+                    await callback.message.answer_sticker(file_id)
+                    await callback.message.answer(header)
+                elif media_type == "animation":
+                    await callback.message.answer_animation(file_id, caption=caption)
+                else:
+                    await callback.message.answer(f"{header}\n[{media_type}]")
+            else:
+                await callback.message.answer(f"{header}\n[пустое сообщение]")
+        except Exception:
+            await callback.message.answer(f"{header}\n[медиа недоступно]")
 
 # ==================== BUSINESS ОБРАБОТЧИКИ ====================
 
