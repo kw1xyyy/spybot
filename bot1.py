@@ -201,8 +201,8 @@ async def cmd_start(message: Message):
         "3. Добавь этого бота\n"
         "4. Разреши доступ к сообщениям\n\n"
         "После подключения я буду присылать тебе:\n"
-        "• Удалённые сообщения\n"
-        "• Отредактированные сообщения\n"
+        "• Удалённые сообщения (только чужие)\n"
+        "• Отредактированные сообщения (только чужие)\n"
         "• Медиа, на которые ты ответишь (кроме своих)\n\n"
         "<b>Команды:</b>\n"
         "/chats — список чатов и история\n"
@@ -453,6 +453,11 @@ async def on_edited_business_message(message: Message):
     if not owner_id:
         return
 
+    # Не уведомляем, если сообщение отредактировал сам владелец
+    if message.from_user and message.from_user.id == owner_id:
+        await save_message(message, connection_id)
+        return
+
     old = await get_message(message.chat.id, message.message_id)
     old_text = old[1] if old else "не сохранено"
     new_text = message.text or message.caption or "[медиа]"
@@ -482,6 +487,10 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted):
 
         if saved:
             name, text, media_type, file_id, _ = saved
+
+            # Можно раскомментировать, если тоже не хотите уведомления о своих удалениях
+            # if ... (нужно было бы хранить from_user_id и проверять)
+
             notify = (
                 f"🗑 <b>Сообщение удалено</b>\n"
                 f"От: {name}\n\n"
