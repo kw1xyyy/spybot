@@ -179,7 +179,7 @@ async def get_chats_for_user(user_id: int) -> list[tuple]:
         async with db.execute(query, (*connections, user_id)) as cursor:
             return await cursor.fetchall()
 
-async def get_chat_history(chat_id: int, connection_ids: list[str], limit: int = 50) -> list[tuple]:
+async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tuple]:
     if not connection_ids:
         return []
 
@@ -191,11 +191,9 @@ async def get_chat_history(chat_id: int, connection_ids: list[str], limit: int =
             FROM messages
             WHERE chat_id = ? AND connection_id IN ({placeholders})
             ORDER BY date ASC
-            LIMIT ?
         """
-        async with db.execute(query, (chat_id, *connection_ids, limit)) as cursor:
+        async with db.execute(query, (chat_id, *connection_ids)) as cursor:
             return await cursor.fetchall()
-
 # ==================== КОМАНДЫ ====================
 
 @dp.message(CommandStart())
@@ -279,7 +277,7 @@ async def show_history(callback: CallbackQuery):
 
     user_id = callback.from_user.id
     connections = await get_user_connections(user_id)
-    history = await get_chat_history(chat_id, connections, limit=50)
+    history = await get_chat_history(chat_id, connections)
 
     if not history:
         await callback.message.answer("История этого чата пуста.")
