@@ -194,6 +194,7 @@ async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tupl
         """
         async with db.execute(query, (chat_id, *connection_ids)) as cursor:
             return await cursor.fetchall()
+
 # ==================== КОМАНДЫ ====================
 
 @dp.message(CommandStart())
@@ -241,6 +242,10 @@ async def cmd_status(message: Message):
 
 @dp.message(Command("chats"))
 async def cmd_chats(message: Message):
+    if message.text.strip() == "/chats all":
+        await show_all_history(message)
+        return
+
     user_id = message.from_user.id
     chats = await get_chats_for_user(user_id)
 
@@ -326,38 +331,6 @@ async def show_history(callback: CallbackQuery):
         current_page += 1
         if current_page * 50 < total:
             await callback.message.answer(f"Продолжаю... (страница {current_page + 1})")
-
-# ==================== КОМАНДА ВЫГРУЗКИ ВСЕХ СООБЩЕНИЙ ====================
-
-@dp.message(Command("chats"))
-async def cmd_chats(message: Message):
-    if message.text.strip() == "/chats all":
-        await show_all_history(message)
-        return
-
-    user_id = message.from_user.id
-    chats = await get_chats_for_user(user_id)
-
-    if not chats:
-        await message.answer("У тебя пока нет сохранённых переписок.")
-        return
-
-    buttons = []
-    for chat_id, name, last_date, msg_count in chats:
-        date_str = datetime.fromtimestamp(last_date).strftime("%d.%m %H:%M") if last_date else "—"
-        btn_text = f"{name} ({msg_count}) • {date_str}"
-        buttons.append([
-            InlineKeyboardButton(
-                text=btn_text[:64],
-                callback_data=f"history:{chat_id}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(
-        f"<b>Твои чаты</b> ({len(chats)}):\nВыбери чат, чтобы посмотреть историю:",
-        reply_markup=keyboard
-    )
 
 async def show_all_history(message: Message):
     user_id = message.from_user.id
@@ -495,7 +468,181 @@ async def on_business_connection(connection: BusinessConnection):
 
     logger.info(f"Business connection {status}: user={connection.user.id}")
 
-# (все остальные обработчики on_business_message, on_edited_business_message, on_deleted_business_messages остаются без изменений)
+@dp.business_message()
+async def on_business_message(message: Message):
+    connection_id = message.business_connection_id
+    await save_message(message, connection_id)
+
+    if not (message.reply_to_message and message.from_user and connection_id):
+        return
+
+    owner_id = await get_user_by_connection(connection_id)
+    if not owner_id or message.from_user.id != owner_id:
+        return
+
+    replied = message.reply_to_message
+
+    if replied.from_user and replied.from_user.id == owner_id:
+        return
+
+    media_type = None
+    file_id = None
+
+    if replied.photo:
+        media_type = "photo"
+        file_id = replied.photo[-1].file_id
+    elif replied.video:
+        media_type = "video"
+        file_id = replied.video.file_id
+    elif replied.video_note:
+        media_type = "video_note"
+        file_id = replied.video_note.file_id
+    elif replied.voice:
+        media_type = "voice"
+        file_id = replied.voice.file_id
+    elif replied.document:
+        media_type = "document"
+        file_id = replied.document.file_id
+    elif replied.animation:
+        media_type = "animation"
+        file_id = replied.animation.file_id
+    elif replied.sticker:
+        media_type = "sticker"
+        file_id = replied.sticker.file_id
+
+    if not file_id:
+        return
+
+    try:
+        file = await bot.get_file(file_id)
+        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(file_url) as resp:
+                if resp.status != 200:
+                    await bot.send_message(owner_id, "❌ Не удалось скачать файл")
+                    return
+
+                content = await resp.read()
+
+                ext = {
+                    "photo": ".jpg",
+                    "video": ".mp4",
+                    "animation": ".mp4",
+                    "video_note": ".mp4",
+                    "voice": ".ogg",
+                    "sticker": ".webp",
+                }.get(media_type, ".bin")
+
+                temp_filename = f"temp_{message.message_id}{ext}"
+                with open(temp_filename, "wb") as f:
+                    f.write(content)
+
+                input_file = FSInputFile(temp_filename)
+                caption = (
+                    f"💾 <b>Сохранено</b>\n"
+                    f"От: {replied.from_user.full_name if replied.from_user else 'неизвестно'}"
+                )
+
+                if media_type == "photo":
+                    await bot.send_photo(owner_id, input_file, caption=caption)
+                elif media_type == "video":
+                    await bot.send_video(owner_id, input_file, caption=caption)
+                elif media_type == "voice":
+                    await bot.send_voice(owner_id, input_file, caption=caption)
+                elif media_type == "document":
+                    await bot.send_document(owner_id, input_file, caption=caption)
+                elif media_type == "animation":
+                    await bot.send_animation(owner_id, input_file, caption=caption)
+                elif media_type == "video_note":
+                    await bot.send_video_note(owner_id, input_file)
+                    await bot.send_message(owner_id, caption)
+                elif media_type == "sticker":
+                    await bot.send_sticker(owner_id, input_file)
+                    await bot.send_message(owner_id, caption)
+
+                os.remove(temp_filename)
+
+    except Exception as e:
+        logger.error(f"Save media error: {e}")
+        try:
+            await bot.send_message(owner_id, f"❌ Ошибка: {e}")
+        except Exception:
+            pass
+
+@dp.edited_business_message()
+async def on_edited_business_message(message: Message):
+    connection_id = message.business_connection_id
+    if not connection_id:
+        return
+
+    owner_id = await get_user_by_connection(connection_id)
+    if not owner_id:
+        return
+
+    if message.from_user and message.from_user.id == owner_id:
+        await save_message(message, connection_id)
+        return
+
+    old = await get_message(message.chat.id, message.message_id)
+    old_text = old[1] if old else "не сохранено"
+    new_text = message.text or message.caption or "[медиа]"
+    from_user = message.from_user.full_name if message.from_user else "Неизвестно"
+
+    text = (
+        f"✏️ <b>Сообщение отредактировано</b>\n"
+        f"От: {from_user}\n\n"
+        f"<b>Было:</b>\n<code>{old_text}</code>\n\n"
+        f"<b>Стало:</b>\n<code>{new_text}</code>"
+    )
+    await bot.send_message(owner_id, text)
+    await save_message(message, connection_id)
+
+@dp.deleted_business_messages()
+async def on_deleted_business_messages(event: BusinessMessagesDeleted):
+    connection_id = event.business_connection_id
+    if not connection_id:
+        return
+
+    owner_id = await get_user_by_connection(connection_id)
+    if not owner_id:
+        return
+
+    for msg_id in event.message_ids:
+        saved = await get_message(event.chat.id, msg_id)
+
+        if saved:
+            name, text, media_type, file_id, _ = saved
+            notify = (
+                f"🗑 <b>Сообщение удалено</b>\n"
+                f"От: {name}\n\n"
+                f"<b>Текст:</b>\n<code>{text or '[без текста]'}</code>"
+            )
+            await bot.send_message(owner_id, notify)
+
+            if file_id and media_type:
+                try:
+                    if media_type == "photo":
+                        await bot.send_photo(owner_id, file_id, caption="📷 Восстановленное фото")
+                    elif media_type == "video":
+                        await bot.send_video(owner_id, file_id, caption="🎬 Восстановленное видео")
+                    elif media_type == "voice":
+                        await bot.send_voice(owner_id, file_id, caption="🎤 Восстановленное голосовое")
+                    elif media_type == "document":
+                        await bot.send_document(owner_id, file_id, caption="📄 Восстановленный файл")
+                    elif media_type == "video_note":
+                        await bot.send_video_note(owner_id, file_id)
+                    elif media_type == "sticker":
+                        await bot.send_sticker(owner_id, file_id)
+                    elif media_type == "animation":
+                        await bot.send_animation(owner_id, file_id, caption="🎞️ Восстановленная анимация")
+                except Exception as e:
+                    logger.warning(f"Не удалось отправить медиа: {e}")
+        else:
+            await bot.send_message(
+                owner_id,
+                f"🗑 Удалено сообщение (id <code>{msg_id}</code>), оригинал не был сохранён."
+            )
 
 # ==================== ЗАПУСК ====================
 
