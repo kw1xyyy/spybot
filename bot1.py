@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 
 import aiosqlite
 import aiohttp
@@ -55,6 +56,13 @@ async def init_db():
             )
         """)
         await db.commit()
+
+        # Автоматическая очистка старых сообщений при запуске
+        try:
+            await db.execute("DELETE FROM messages")
+            logger.info("✅ База сообщений очищена при запуске")
+        except Exception as e:
+            logger.warning(f"Не удалось очистить сообщения: {e}")
 
 async def save_connection(connection: BusinessConnection):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -195,19 +203,12 @@ async def cmd_start(message: Message):
         "👋 <b>Привет!</b>\n\n"
         "Это бот для отслеживания удалённых и отредактированных сообщений "
         "в личных чатах (через Telegram Business).\n\n"
-        "<b>Как подключить:</b>\n"
-        "1. Открой настройки Telegram → <b>Telegram Business</b>\n"
-        "2. Перейди в раздел <b>Чат-боты</b>\n"
-        "3. Добавь этого бота\n"
-        "4. Разреши доступ к сообщениям\n\n"
-        "После подключения я буду присылать тебе:\n"
-        "• Удалённые сообщения (только чужие)\n"
-        "• Отредактированные сообщения (только чужие)\n"
-        "• Медиа, на которые ты ответишь (кроме своих)\n\n"
         "<b>Команды:</b>\n"
         "/chats — список чатов и история\n"
+        "/chats all — показать ВСЕ сообщения\n"
         "/status — проверить подключение\n"
-        "/myid — узнать свой ID"
+        "/myid — узнать свой ID\n"
+        "/clear — ОЧИСТИТЬ базу (сначала сохранит дамп)"
     )
     await message.answer(text)
 
@@ -318,6 +319,61 @@ async def show_history(callback: CallbackQuery):
         except Exception:
             await callback.message.answer(f"{header}\n[медиа недоступно]")
 
+# ==================== НОВЫЕ ФУНКЦИИ ДЛЯ ОЧИСТКИ ====================
+
+async def create_backup() -> str | None:
+    """Создаёт дамп базы в формате SQL"""
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_filename = f"messages_backup_{timestamp}.sql"
+    backup_path = Path(".").joinpath(backup_filename)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async for line in db.iterdump():
+                backup_path.write_text(line, encoding="utf-8", mode="a")
+
+        logger.info(f"✅ Сохранён дамп базы: {backup_filename}")
+        return str(backup_path)
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания дампа: {e}")
+        return None
+
+
+@dp.message(Command("clear"))
+async def cmd_clear(message: Message):
+    await message.answer("⚠️ <b>Внимание!</b>\n\n"
+                         "Это действие <b>необратимо</b>!\n"
+                         "Все сообщения будут удалены навсегда.\n"
+                         "Сначала будет создан дамп базы.\n\n"
+                         "Напиши <b>ДА</b>, чтобы подтвердить.")
+
+    @dp.message(F.text == "ДА")
+    async def confirm_clear(m: Message):
+        try:
+            backup_path = await create_backup()
+            if backup_path:
+                await m.answer_document(
+                    FSInputFile(backup_path),
+                    caption="✅ <b>Сохранён дамп базы</b>\n"
+                            "Теперь бот очистит историю."
+                )
+            else:
+                await m.answer("❌ Не удалось создать дамп.")
+
+            # Очистка таблицы messages
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM messages")
+                await db.commit()
+
+            await m.answer("✅ <b>База сообщений успешно очищена</b>\n"
+                           "Все данные удалены, кроме записей о подключениях.")
+
+            logger.info("База сообщений очищена")
+
+        except Exception as e:
+            await m.answer(f"❌ Ошибка: {e}")
+
 # ==================== BUSINESS ОБРАБОТЧИКИ ====================
 
 @dp.business_connection()
@@ -344,7 +400,6 @@ async def on_business_message(message: Message):
     connection_id = message.business_connection_id
     await save_message(message, connection_id)
 
-    # Сохраняем медиа только если владелец ответил на чужое медиа
     if not (message.reply_to_message and message.from_user and connection_id):
         return
 
@@ -354,7 +409,6 @@ async def on_business_message(message: Message):
 
     replied = message.reply_to_message
 
-    # Не сохраняем свои же медиа
     if replied.from_user and replied.from_user.id == owner_id:
         return
 
@@ -453,7 +507,6 @@ async def on_edited_business_message(message: Message):
     if not owner_id:
         return
 
-    # Не уведомляем, если сообщение отредактировал сам владелец
     if message.from_user and message.from_user.id == owner_id:
         await save_message(message, connection_id)
         return
@@ -487,10 +540,6 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted):
 
         if saved:
             name, text, media_type, file_id, _ = saved
-
-            # Можно раскомментировать, если тоже не хотите уведомления о своих удалениях
-            # if ... (нужно было бы хранить from_user_id и проверять)
-
             notify = (
                 f"🗑 <b>Сообщение удалено</b>\n"
                 f"От: {name}\n\n"
