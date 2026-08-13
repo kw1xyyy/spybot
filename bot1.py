@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -188,7 +187,6 @@ async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tupl
             return await cursor.fetchall()
 
 async def get_chat_history_full(chat_id: int, connection_ids: list[str]) -> list[tuple]:
-    """Полная история без ограничения"""
     if not connection_ids:
         return []
 
