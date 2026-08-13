@@ -145,63 +145,6 @@ async def save_message(message: Message, connection_id: str | None = None):
         ))
         await db.commit()
 
-# ==================== ИСТОРИЯ ====================
-
-async def get_chats_for_user(user_id: int) -> list[tuple]:
-    connections = await get_user_connections(user_id)
-    if not connections:
-        return []
-
-    placeholders = ",".join("?" * len(connections))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT 
-                chat_id,
-                from_user_name,
-                MAX(date) as last_date,
-                COUNT(*) as msg_count
-            FROM messages
-            WHERE connection_id IN ({placeholders})
-              AND from_user_id != ?
-            GROUP BY chat_id
-            ORDER BY last_date DESC
-        """
-        async with db.execute(query, (*connections, user_id)) as cursor:
-            return await cursor.fetchall()
-
-async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tuple]:
-    if not connection_ids:
-        return []
-
-    placeholders = ",".join("?" * len(connection_ids))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT from_user_name, text, media_type, file_id, date
-            FROM messages
-            WHERE chat_id = ? AND connection_id IN ({placeholders})
-            ORDER BY date ASC
-        """
-        async with db.execute(query, (chat_id, *connection_ids)) as cursor:
-            return await cursor.fetchall()
-
-async def get_chat_history_full(chat_id: int, connection_ids: list[str]) -> list[tuple]:
-    if not connection_ids:
-        return []
-
-    placeholders = ",".join("?" * len(connection_ids))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT from_user_name, text, media_type, file_id, date
-            FROM messages
-            WHERE chat_id = ? AND connection_id IN ({placeholders})
-            ORDER BY date ASC
-        """
-        async with db.execute(query, (chat_id, *connection_ids)) as cursor:
-            return await cursor.fetchall()
-
 # ==================== КОМАНДЫ ====================
 
 @dp.message(CommandStart())
@@ -211,7 +154,7 @@ async def cmd_start(message: Message):
         "Это бот для отслеживания удалённых и отредактированных сообщений.\n\n"
         "<b>Команды:</b>\n"
         "/chats — список чатов\n"
-        "/chats all — показать ВСЕ сообщения (полностью)\n"
+        "/chats all — показать ВСЕ сообщения\n"
         "/status — подключение\n"
         "/myid — твой ID\n"
         "/clear — ОЧИСТИТЬ базу"
@@ -480,6 +423,7 @@ async def on_business_message(message: Message):
     connection_id = message.business_connection_id
     await save_message(message, connection_id)
 
+    # Сохраняем медиа только если владелец ответил на чужое медиа
     if not (message.reply_to_message and message.from_user and connection_id):
         return
 
@@ -489,6 +433,7 @@ async def on_business_message(message: Message):
 
     replied = message.reply_to_message
 
+    # Не сохраняем свои же медиа
     if replied.from_user and replied.from_user.id == owner_id:
         return
 
