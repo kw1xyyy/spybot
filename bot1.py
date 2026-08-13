@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -145,6 +146,14 @@ async def save_message(message: Message, connection_id: str | None = None):
         ))
         await db.commit()
 
+async def get_message(chat_id: int, message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT from_user_name, text, media_type, file_id, connection_id FROM messages WHERE chat_id = ? AND message_id = ?",
+            (chat_id, message_id)
+        ) as cursor:
+            return await cursor.fetchone()
+
 # ==================== ИСТОРИЯ ====================
 
 async def get_chats_for_user(user_id: int) -> list[tuple]:
@@ -186,22 +195,6 @@ async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tupl
         async with db.execute(query, (chat_id, *connection_ids)) as cursor:
             return await cursor.fetchall()
 
-async def get_chat_history_full(chat_id: int, connection_ids: list[str]) -> list[tuple]:
-    if not connection_ids:
-        return []
-
-    placeholders = ",".join("?" * len(connection_ids))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT from_user_name, text, media_type, file_id, date
-            FROM messages
-            WHERE chat_id = ? AND connection_id IN ({placeholders})
-            ORDER BY date ASC
-        """
-        async with db.execute(query, (chat_id, *connection_ids)) as cursor:
-            return await cursor.fetchall()
-
 # ==================== КОМАНДЫ ====================
 
 @dp.message(CommandStart())
@@ -211,7 +204,7 @@ async def cmd_start(message: Message):
         "Это бот для отслеживания удалённых и отредактированных сообщений.\n\n"
         "<b>Команды:</b>\n"
         "/chats — список чатов\n"
-        "/chats all — показать ВСЕ сообщения\n"
+        "/chats all — показать ВСЕ сообщения (по частям, если много)\n"
         "/status — подключение\n"
         "/myid — твой ID\n"
         "/clear — ОЧИСТИТЬ базу"
