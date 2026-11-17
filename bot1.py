@@ -9,6 +9,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -35,6 +36,9 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = str(DATA_DIR / "messages.db")
 INDEX_HTML = Path(__file__).parent / "webapp" / "index.html"
+TG_JS_URL = "https://telegram.org/js/telegram-web-app.js"
+TG_JS_LOCAL = Path(__file__).parent / "telegram-web-app.js"  # можно положить вручную
+TG_JS_CACHE = DATA_DIR / "telegram-web-app.js"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -353,6 +357,20 @@ async def find_message(uid: int, chat: int, msg_id: int):
 async def api_index(_):
     return web.FileResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
 
+async def api_tgjs(_):
+    """Отдаёт скрипт Telegram с нашего сервера: у части пользователей telegram.org не открывается."""
+    path = TG_JS_LOCAL if TG_JS_LOCAL.exists() else TG_JS_CACHE
+    if not path.exists():
+        try:
+            timeout = aiohttp.ClientTimeout(total=15)
+            async with aiohttp.ClientSession(timeout=timeout) as s, s.get(TG_JS_URL) as r:
+                r.raise_for_status()
+                TG_JS_CACHE.write_bytes(await r.read())
+        except Exception as e:
+            log.error("Не удалось скачать telegram-web-app.js: %s", e)
+            raise web.HTTPBadGateway()
+    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
+
 async def api_chats(request: web.Request):
     uid = auth(request)
     rows = await fetchall(f"""
@@ -429,7 +447,7 @@ async def api_avatar(request: web.Request):
 def make_web_app() -> web.Application:
     app = web.Application()
     app.add_routes([
-        web.get("/", api_index), web.get("/api/chats", api_chats),
+        web.get("/", api_index), web.get("/tg.js", api_tgjs), web.get("/api/chats", api_chats),
         web.get("/api/history", api_history), web.get("/api/media", api_media),
         web.get("/api/avatar", api_avatar), web.post("/api/resend", api_resend)])
     return app
