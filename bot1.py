@@ -455,10 +455,9 @@ def make_web_app() -> web.Application:
 # ==================== ПЕРЕНОС СТАРОЙ БАЗЫ ====================
 
 async def migrate_old_db():
-    """Переносит сообщения из old_messages.db (можно запускать повторно, дублей не будет)."""
-    for src in (Path(__file__).parent / "old_messages.db", DATA_DIR / "old_messages.db"):
-        if not src.exists():
-            continue
+    """Переносит сообщения из old_messages*.db (можно запускать повторно, дублей не будет)."""
+    folders = (Path(__file__).parent, DATA_DIR)
+    for src in sorted({p.resolve() for d in folders for p in d.glob("old_messages*.db")}):
         await db.commit()
         await db.execute("ATTACH DATABASE ? AS old", (str(src),))
         try:
