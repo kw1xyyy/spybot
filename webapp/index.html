@@ -55,7 +55,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 <body>
 <section id="list">
   <input id="q" type="search" placeholder="Поиск по чатам" autocomplete="off">
-  <div id="items"></div>
+  <div id="items"><p class="empty">Загрузка…</p></div>
 </section>
 <section id="chat" hidden>
   <div id="head"></div>
@@ -64,6 +64,15 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 </section>
 
 <script>
+const say = t => {
+  const box = document.querySelector('#items');
+  const p = document.createElement('p');
+  p.className = 'empty'; p.textContent = t;
+  box.replaceChildren(p);
+};
+window.addEventListener('error', e => say('Ошибка: ' + e.message));
+window.addEventListener('unhandledrejection', e => say('Ошибка: ' + ((e.reason && e.reason.message) || e.reason)));
+if (!window.Telegram || !window.Telegram.WebApp) throw new Error('не загрузился telegram-web-app.js');
 const tg = window.Telegram.WebApp;
 tg.ready(); tg.expand();
 
@@ -76,9 +85,13 @@ const el = (tag, cls, text) => {
 };
 const headers = () => ({ 'X-Init-Data': tg.initData });
 const get = async url => {
-  const r = await fetch(url, { headers: headers() });
-  if (!r.ok) throw new Error(r.status);
-  return r;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 20000);
+  try {
+    const r = await fetch(url, { headers: headers(), signal: ctl.signal });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + url.split('?')[0]);
+    return r;
+  } finally { clearTimeout(timer); }
 };
 
 // Файлы просят с заголовком авторизации, поэтому грузим через blob
@@ -254,11 +267,11 @@ tg.BackButton.onClick(backToList);
 
 (async () => {
   if (!tg.initData) {
-    $('#items').append(el('p', 'empty', 'Откройте это приложение из Telegram: кнопка «История» в чате с ботом.'));
+    say('Откройте это приложение из Telegram: кнопка «История» в чате с ботом.');
     return;
   }
   try { chats = await (await get('/api/chats')).json(); renderList(); }
-  catch { $('#items').append(el('p', 'empty', 'Не удалось загрузить чаты. Закройте приложение и откройте снова.')); }
+  catch (e) { say('Не удалось загрузить чаты: ' + e.message); }
 })();
 </script>
 </body>
