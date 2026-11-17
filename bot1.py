@@ -1,655 +1,455 @@
+"""Telegram Business-бот: хранит переписки, сообщает об удалённом/изменённом
+и показывает историю чатов в Mini App (aiogram 3 + aiohttp + aiosqlite)."""
 import asyncio
+import html
+import io
 import logging
-import os
+import time
 from datetime import datetime
 from pathlib import Path
 
 import aiosqlite
-import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message, BusinessConnection, BusinessMessagesDeleted, FSInputFile,
-    CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-)
-from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BufferedInputFile, BusinessConnection, BusinessMessagesDeleted, CallbackQuery,
+    InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message, WebAppInfo,
+)
+from aiogram.utils.web_app import safe_parse_webapp_init_data
+from aiohttp import web
 
-from config import BOT_TOKEN
+import config
+
+BOT_TOKEN = config.BOT_TOKEN
+WEBAPP_URL = getattr(config, "WEBAPP_URL", "").rstrip("/")  # публичный https-адрес
+WEB_HOST = getattr(config, "WEB_HOST", "127.0.0.1")
+WEB_PORT = getattr(config, "WEB_PORT", 8080)
+DB_PATH = "messages.db"
+INDEX_HTML = Path(__file__).parent / "webapp" / "index.html"
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+db: aiosqlite.Connection  # одно соединение на весь процесс
 
-DB_PATH = "messages.db"
+esc = html.escape
+MEDIA_KINDS = ("video", "voice", "document", "video_note", "sticker", "animation", "audio")
+NO_CAPTION = {"video_note", "sticker"}
+EXT = {"photo": ".jpg", "video": ".mp4", "animation": ".mp4", "video_note": ".mp4",
+       "voice": ".ogg", "sticker": ".webp", "audio": ".mp3"}
+MIME = {"photo": "image/jpeg", "sticker": "image/webp", "video": "video/mp4",
+        "animation": "video/mp4", "video_note": "video/mp4", "voice": "audio/ogg",
+        "audio": "audio/mpeg"}
+OWNED = "connection_id IN (SELECT connection_id FROM connections WHERE user_id = ?)"
 
-# ==================== БАЗА ДАННЫХ ====================
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS connections (
+    connection_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL, user_name TEXT,
+    is_enabled INTEGER DEFAULT 1, connected_at INTEGER);
+CREATE TABLE IF NOT EXISTS chats (
+    connection_id TEXT, chat_id INTEGER, title TEXT,
+    PRIMARY KEY (connection_id, chat_id));
+CREATE TABLE IF NOT EXISTS messages (
+    connection_id TEXT, chat_id INTEGER, message_id INTEGER,
+    from_user_id INTEGER, from_user_name TEXT, text TEXT,
+    media_type TEXT, file_id TEXT, date INTEGER,
+    edited INTEGER DEFAULT 0, deleted INTEGER DEFAULT 0,
+    PRIMARY KEY (connection_id, chat_id, message_id));
+CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages (chat_id, message_id);
+"""
 
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS connections (
-                connection_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                user_name TEXT,
-                is_enabled INTEGER DEFAULT 1,
-                connected_at INTEGER
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                chat_id INTEGER,
-                message_id INTEGER,
-                connection_id TEXT,
-                from_user_id INTEGER,
-                from_user_name TEXT,
-                text TEXT,
-                media_type TEXT,
-                file_id TEXT,
-                date INTEGER,
-                PRIMARY KEY (chat_id, message_id)
-            )
-        """)
-        await db.commit()
+# ==================== БАЗА ====================
 
-        try:
-            await db.execute("DELETE FROM messages")
-            logger.info("✅ База сообщений очищена при запуске")
-        except Exception as e:
-            logger.warning(f"Не удалось очистить сообщения: {e}")
+async def fetchall(sql: str, args: tuple = ()):
+    async with db.execute(sql, args) as cur:
+        return await cur.fetchall()
 
-async def save_connection(connection: BusinessConnection):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO connections
-            (connection_id, user_id, user_name, is_enabled, connected_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            connection.id,
-            connection.user.id,
-            connection.user.full_name,
-            1 if connection.is_enabled else 0,
-            int(connection.date.timestamp()) if connection.date else int(datetime.now().timestamp())
-        ))
-        await db.commit()
+async def fetchone(sql: str, args: tuple = ()):
+    async with db.execute(sql, args) as cur:
+        return await cur.fetchone()
 
-async def get_user_by_connection(connection_id: str) -> int | None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id FROM connections WHERE connection_id = ? AND is_enabled = 1",
-            (connection_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else None
+async def get_owner(connection_id: str) -> int | None:
+    row = await fetchone(
+        "SELECT user_id FROM connections WHERE connection_id = ? AND is_enabled = 1",
+        (connection_id,))
+    return row[0] if row else None
 
-async def get_user_connections(user_id: int) -> list[str]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT connection_id FROM connections WHERE user_id = ? AND is_enabled = 1",
-            (user_id,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+async def save_connection(c: BusinessConnection):
+    await db.execute(
+        "INSERT OR REPLACE INTO connections VALUES (?, ?, ?, ?, ?)",
+        (c.id, c.user.id, c.user.full_name, int(c.is_enabled),
+         int((c.date or datetime.now()).timestamp())))
+    await db.commit()
 
-async def save_message(message: Message, connection_id: str | None = None):
-    text = message.text or message.caption or ""
-    media_type = None
-    file_id = None
+def extract_media(m: Message) -> tuple[str | None, str | None]:
+    if m.photo:
+        return "photo", m.photo[-1].file_id
+    for kind in MEDIA_KINDS:
+        obj = getattr(m, kind)
+        if obj:
+            return kind, obj.file_id
+    return None, None
 
-    if message.photo:
-        media_type = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.video:
-        media_type = "video"
-        file_id = message.video.file_id
-    elif message.voice:
-        media_type = "voice"
-        file_id = message.voice.file_id
-    elif message.document:
-        media_type = "document"
-        file_id = message.document.file_id
-    elif message.video_note:
-        media_type = "video_note"
-        file_id = message.video_note.file_id
-    elif message.sticker:
-        media_type = "sticker"
-        file_id = message.sticker.file_id
-    elif message.animation:
-        media_type = "animation"
-        file_id = message.animation.file_id
+async def save_message(m: Message, conn_id: str):
+    kind, file_id = extract_media(m)
+    u = m.from_user
+    await db.execute("""
+        INSERT INTO messages (connection_id, chat_id, message_id, from_user_id, from_user_name,
+                              text, media_type, file_id, date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (connection_id, chat_id, message_id) DO UPDATE SET
+            text = excluded.text, media_type = excluded.media_type,
+            file_id = excluded.file_id, edited = 1""",
+        (conn_id, m.chat.id, m.message_id, u.id if u else 0,
+         u.full_name if u else "Неизвестно", m.text or m.caption or "",
+         kind, file_id, int(m.date.timestamp())))
+    await db.execute(
+        "INSERT INTO chats VALUES (?, ?, ?) ON CONFLICT DO UPDATE SET title = excluded.title",
+        (conn_id, m.chat.id, m.chat.full_name))
+    await db.commit()
 
-    from_user = message.from_user
-    name = from_user.full_name if from_user else "Неизвестно"
-    user_id = from_user.id if from_user else 0
-    conn_id = connection_id or getattr(message, "business_connection_id", None)
+# ==================== ОТПРАВКА МЕДИА ====================
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO messages
-            (chat_id, message_id, connection_id, from_user_id, from_user_name, text, media_type, file_id, date)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            message.chat.id,
-            message.message_id,
-            conn_id,
-            user_id,
-            name,
-            text,
-            media_type,
-            file_id,
-            int(message.date.timestamp()) if message.date else 0
-        ))
-        await db.commit()
+async def send_media(chat_id: int, kind: str, file, caption: str | None = None):
+    send = getattr(bot, f"send_{kind}")
+    if kind in NO_CAPTION:
+        await send(chat_id, file)
+        if caption:
+            await bot.send_message(chat_id, caption)
+    else:
+        await send(chat_id, file, caption=caption)
 
-async def get_message(chat_id: int, message_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT from_user_name, text, media_type, file_id, connection_id FROM messages WHERE chat_id = ? AND message_id = ?",
-            (chat_id, message_id)
-        ) as cursor:
-            return await cursor.fetchone()
-
-# ==================== ИСТОРИЯ ====================
-
-async def get_chats_for_user(user_id: int) -> list[tuple]:
-    connections = await get_user_connections(user_id)
-    if not connections:
-        return []
-
-    placeholders = ",".join("?" * len(connections))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT 
-                chat_id,
-                from_user_name,
-                MAX(date) as last_date,
-                COUNT(*) as msg_count
-            FROM messages
-            WHERE connection_id IN ({placeholders})
-              AND from_user_id != ?
-            GROUP BY chat_id
-            ORDER BY last_date DESC
-        """
-        async with db.execute(query, (*connections, user_id)) as cursor:
-            return await cursor.fetchall()
-
-async def get_chat_history(chat_id: int, connection_ids: list[str]) -> list[tuple]:
-    if not connection_ids:
-        return []
-
-    placeholders = ",".join("?" * len(connection_ids))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT from_user_name, text, media_type, file_id, date
-            FROM messages
-            WHERE chat_id = ? AND connection_id IN ({placeholders})
-            ORDER BY date ASC
-        """
-        async with db.execute(query, (chat_id, *connection_ids)) as cursor:
-            return await cursor.fetchall()
+def clip(text: str, n: int = 3500) -> str:
+    return text if len(text) <= n else text[:n] + "…"
 
 # ==================== КОМАНДЫ ====================
 
+def app_keyboard() -> InlineKeyboardMarkup | None:
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📱 Открыть историю", web_app=WebAppInfo(url=WEBAPP_URL))]])
+
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
-    text = (
-        "👋 <b>Привет!</b>\n\n"
-        "Это бот для отслеживания удалённых и отредактированных сообщений.\n\n"
-        "<b>Команды:</b>\n"
-        "/chats — список чатов\n"
-        "/chats all — показать ВСЕ сообщения (по частям, если много)\n"
+async def cmd_start(m: Message):
+    await m.answer(
+        "👋 <b>Привет!</b>\n\nЯ слежу за удалёнными и изменёнными сообщениями "
+        "в твоих личных чатах (Telegram Business).\n\n"
+        "/chats — история чатов в мини-приложении\n"
+        "/export — выгрузка всей истории файлом\n"
         "/status — подключение\n"
         "/myid — твой ID\n"
-        "/clear — ОЧИСТИТЬ базу"
-    )
-    await message.answer(text)
+        "/clear — удалить свою историю",
+        reply_markup=app_keyboard())
 
 @dp.message(Command("myid"))
-async def cmd_myid(message: Message):
-    await message.answer(f"Твой ID: <code>{message.from_user.id}</code>")
+async def cmd_myid(m: Message):
+    await m.answer(f"Твой ID: <code>{m.from_user.id}</code>")
 
 @dp.message(Command("status"))
-async def cmd_status(message: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT connection_id, is_enabled, connected_at FROM connections WHERE user_id = ?",
-            (message.from_user.id,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-
+async def cmd_status(m: Message):
+    rows = await fetchall(
+        "SELECT connection_id, is_enabled, connected_at FROM connections WHERE user_id = ?",
+        (m.from_user.id,))
     if not rows:
-        await message.answer(
-            "❌ Бот ещё не подключён.\n\n"
-            "Подключи его через:\n"
-            "Настройки → Telegram Business → Чат-боты"
-        )
+        await m.answer("❌ Бот ещё не подключён.\n\n"
+                       "Настройки → Telegram Business → Чат-боты")
         return
-
-    text = "<b>Твои подключения:</b>\n\n"
-    for conn_id, is_enabled, connected_at in rows:
-        status = "✅ Активно" if is_enabled else "❌ Отключено"
-        date = datetime.fromtimestamp(connected_at).strftime("%d.%m.%Y %H:%M") if connected_at else "—"
-        text += f"• {status}\n  ID: <code>{conn_id}</code>\n  Дата: {date}\n\n"
-
-    await message.answer(text)
+    lines = ["<b>Твои подключения:</b>\n"]
+    for conn_id, enabled, at in rows:
+        when = datetime.fromtimestamp(at).strftime("%d.%m.%Y %H:%M") if at else "—"
+        lines.append(f"• {'✅ Активно' if enabled else '❌ Отключено'}\n"
+                     f"  ID: <code>{conn_id}</code>\n  Дата: {when}\n")
+    await m.answer("\n".join(lines))
 
 @dp.message(Command("chats"))
-async def cmd_chats(message: Message):
-    if message.text.strip() == "/chats all":
-        await show_all_history(message)
+async def cmd_chats(m: Message):
+    kb = app_keyboard()
+    if not kb:
+        await m.answer("Mini App не настроен: добавь <code>WEBAPP_URL</code> в config.py. "
+                       "Пока доступен /export.")
         return
+    await m.answer("История чатов — в мини-приложении 👇", reply_markup=kb)
 
-    user_id = message.from_user.id
-    chats = await get_chats_for_user(user_id)
+async def build_export(uid: int) -> bytes:
+    rows = await fetchall(f"""
+        SELECT COALESCE(c.title, m.from_user_name), m.date, m.from_user_name,
+               COALESCE(NULLIF(m.text, ''), '[' || m.media_type || ']', ''), m.deleted
+        FROM messages m LEFT JOIN chats c USING (connection_id, chat_id)
+        WHERE m.{OWNED} ORDER BY 1, m.date""", (uid,))
+    out, current = [], None
+    for title, date, who, text, deleted in rows:
+        if title != current:
+            current = title
+            out.append(f"\n=== {title} ===")
+        stamp = datetime.fromtimestamp(date).strftime("%d.%m.%Y %H:%M")
+        out.append(f"[{stamp}] {who}{' (удалено)' if deleted else ''}: {text}")
+    return "\n".join(out).strip().encode()
 
-    if not chats:
-        await message.answer("У тебя пока нет сохранённых переписок.")
+@dp.message(Command("export"))
+async def cmd_export(m: Message):
+    data = await build_export(m.from_user.id)
+    if not data:
+        await m.answer("История пуста.")
         return
-
-    buttons = []
-    for chat_id, name, last_date, msg_count in chats:
-        date_str = datetime.fromtimestamp(last_date).strftime("%d.%m %H:%M") if last_date else "—"
-        btn_text = f"{name} ({msg_count}) • {date_str}"
-        buttons.append([
-            InlineKeyboardButton(
-                text=btn_text[:64],
-                callback_data=f"history:{chat_id}"
-            )
-        ])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(
-        f"<b>Твои чаты</b> ({len(chats)}):\nВыбери чат, чтобы посмотреть историю:",
-        reply_markup=keyboard
-    )
-
-@dp.callback_query(F.data.startswith("history:"))
-async def show_history(callback: CallbackQuery):
-    await callback.answer()
-
-    try:
-        chat_id = int(callback.data.split(":")[1])
-    except (IndexError, ValueError):
-        await callback.message.answer("Ошибка данных.")
-        return
-
-    user_id = callback.from_user.id
-    connections = await get_user_connections(user_id)
-    history = await get_chat_history(chat_id, connections)
-
-    if not history:
-        await callback.message.answer("История этого чата пуста.")
-        return
-
-    total = len(history)
-    await callback.message.answer(f"📜 <b>История чата</b> (всего {total} сообщений)\n"
-                                   f"Выгружаю по частям...")
-
-    current_page = 0
-    while current_page < total:
-        chunk = history[current_page * 50 : (current_page + 1) * 50]
-
-        for name, text, media_type, file_id, date in chunk:
-            time_str = datetime.fromtimestamp(date).strftime("%d.%m %H:%M") if date else ""
-            header = f"<b>{name}</b> <i>{time_str}</i>"
-
-            try:
-                if text:
-                    await callback.message.answer(f"{header}\n{text}")
-                elif media_type and file_id:
-                    caption = f"{header}\n[{media_type}]"
-                    if media_type == "photo":
-                        await callback.message.answer_photo(file_id, caption=caption)
-                    elif media_type == "video":
-                        await callback.message.answer_video(file_id, caption=caption)
-                    elif media_type == "voice":
-                        await callback.message.answer_voice(file_id, caption=caption)
-                    elif media_type == "document":
-                        await callback.message.answer_document(file_id, caption=caption)
-                    elif media_type == "video_note":
-                        await callback.message.answer_video_note(file_id)
-                        await callback.message.answer(header)
-                    elif media_type == "sticker":
-                        await callback.message.answer_sticker(file_id)
-                        await callback.message.answer(header)
-                    elif media_type == "animation":
-                        await callback.message.answer_animation(file_id, caption=caption)
-                    else:
-                        await callback.message.answer(f"{header}\n[{media_type}]")
-                else:
-                    await callback.message.answer(f"{header}\n[пустое сообщение]")
-            except Exception:
-                await callback.message.answer(f"{header}\n[медиа недоступно]")
-
-        current_page += 1
-        if current_page * 50 < total:
-            await callback.message.answer(f"Продолжаю... (страница {current_page + 1})")
-
-async def show_all_history(message: Message):
-    user_id = message.from_user.id
-    connections = await get_user_connections(user_id)
-
-    if not connections:
-        await message.answer("У тебя пока нет сохранённых чатов.")
-        return
-
-    placeholders = ",".join("?" * len(connections))
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        query = f"""
-            SELECT from_user_name, text, media_type, file_id, date, chat_id
-            FROM messages
-            WHERE connection_id IN ({placeholders})
-            ORDER BY date ASC
-        """
-        async with db.execute(query, (*connections,)) as cursor:
-            all_messages = await cursor.fetchall()
-
-    if not all_messages:
-        await message.answer("История пуста.")
-        return
-
-    total = len(all_messages)
-    await message.answer(f"📜 <b>Полная история</b> ({total} сообщений)\n"
-                         f"Выгружаю по частям...")
-
-    current_page = 0
-    while current_page < total:
-        chunk = all_messages[current_page * 50 : (current_page + 1) * 50]
-
-        for name, text, media_type, file_id, date, _ in chunk:
-            time_str = datetime.fromtimestamp(date).strftime("%d.%m %H:%M") if date else ""
-            header = f"<b>{name}</b> <i>{time_str}</i>"
-
-            try:
-                if text:
-                    await message.answer(f"{header}\n{text}")
-                elif media_type and file_id:
-                    caption = f"{header}\n[{media_type}]"
-                    if media_type == "photo":
-                        await message.answer_photo(file_id, caption=caption)
-                    elif media_type == "video":
-                        await message.answer_video(file_id, caption=caption)
-                    elif media_type == "voice":
-                        await message.answer_voice(file_id, caption=caption)
-                    elif media_type == "document":
-                        await message.answer_document(file_id, caption=caption)
-                    elif media_type == "video_note":
-                        await message.answer_video_note(file_id)
-                        await message.answer(header)
-                    elif media_type == "sticker":
-                        await message.answer_sticker(file_id)
-                        await message.answer(header)
-                    elif media_type == "animation":
-                        await message.answer_animation(file_id, caption=caption)
-                    else:
-                        await message.answer(f"{header}\n[{media_type}]")
-                else:
-                    await message.answer(f"{header}\n[пустое сообщение]")
-            except Exception:
-                await message.answer(f"{header}\n[медиа недоступно]")
-
-        current_page += 1
-        if current_page * 50 < total:
-            await message.answer(f"Продолжаю... (страница {current_page + 1})")
-
-# ==================== ОЧИСТКА БАЗЫ ====================
-
-async def create_backup() -> str | None:
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    backup_filename = f"messages_backup_{timestamp}.sql"
-    backup_path = Path(".").joinpath(backup_filename)
-
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async for line in db.iterdump():
-                backup_path.write_text(line, encoding="utf-8", mode="a")
-        logger.info(f"✅ Сохранён дамп базы: {backup_filename}")
-        return str(backup_path)
-    except Exception as e:
-        logger.error(f"❌ Ошибка создания дампа: {e}")
-        return None
-
+    await m.answer_document(BufferedInputFile(data, "history.txt"), caption="📜 Твоя история")
 
 @dp.message(Command("clear"))
-async def cmd_clear(message: Message):
-    await message.answer("⚠️ <b>Внимание!</b>\n\n"
-                         "Это действие <b>необратимо</b>!\n"
-                         "Все сообщения будут удалены навсегда.\n"
-                         "Сначала будет создан дамп базы.\n\n"
-                         "Напиши <b>ДА</b>, чтобы подтвердить.")
+async def cmd_clear(m: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data="clear:yes"),
+        InlineKeyboardButton(text="Отмена", callback_data="clear:no")]])
+    await m.answer("⚠️ <b>Удалить всю твою историю?</b>\n\nДействие необратимо. "
+                   "Перед удалением я пришлю файл с копией.", reply_markup=kb)
 
-    @dp.message(F.text == "ДА")
-    async def confirm_clear(m: Message):
-        try:
-            backup_path = await create_backup()
-            if backup_path:
-                await m.answer_document(
-                    FSInputFile(backup_path),
-                    caption="✅ <b>Сохранён дамп базы</b>\n"
-                            "Теперь бот очистит историю."
-                )
-            else:
-                await m.answer("❌ Не удалось создать дамп.")
+@dp.callback_query(F.data.startswith("clear:"))
+async def on_clear(cb: CallbackQuery):
+    await cb.answer()
+    if cb.data != "clear:yes":
+        await cb.message.edit_text("Отменено.")
+        return
+    uid = cb.from_user.id
+    data = await build_export(uid)
+    if data:
+        await cb.message.answer_document(BufferedInputFile(data, "history_backup.txt"),
+                                         caption="💾 Копия перед удалением")
+    await db.execute(f"DELETE FROM messages WHERE {OWNED}", (uid,))
+    await db.execute(f"DELETE FROM chats WHERE {OWNED}", (uid,))
+    await db.commit()
+    await cb.message.edit_text("✅ История удалена.")
 
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM messages")
-                await db.commit()
-
-            await m.answer("✅ <b>База сообщений успешно очищена</b>")
-        except Exception as e:
-            await m.answer(f"❌ Ошибка: {e}")
-
-# ==================== BUSINESS ОБРАБОТЧИКИ ====================
+# ==================== BUSINESS ====================
 
 @dp.business_connection()
-async def on_business_connection(connection: BusinessConnection):
-    await save_connection(connection)
-
-    status = "подключён ✅" if connection.is_enabled else "отключён ❌"
-    text = (
-        f"<b>Business-соединение {status}</b>\n"
-        f"Пользователь: {connection.user.full_name}\n"
-        f"ID: <code>{connection.user.id}</code>\n"
-        f"Connection ID: <code>{connection.id}</code>"
-    )
-
+async def on_business_connection(c: BusinessConnection):
+    await save_connection(c)
+    status = "подключён ✅" if c.is_enabled else "отключён ❌"
     try:
-        await bot.send_message(connection.user.id, text)
-    except Exception:
+        await bot.send_message(
+            c.user.id,
+            f"<b>Business-соединение {status}</b>\n"
+            f"Пользователь: {esc(c.user.full_name)}\nID: <code>{c.user.id}</code>")
+    except TelegramAPIError:
         pass
-
-    logger.info(f"Business connection {status}: user={connection.user.id}")
+    log.info("Business connection %s: user=%s", status, c.user.id)
 
 @dp.business_message()
-async def on_business_message(message: Message):
-    connection_id = message.business_connection_id
-    await save_message(message, connection_id)
+async def on_business_message(m: Message):
+    conn = m.business_connection_id
+    await save_message(m, conn)
 
-    if not (message.reply_to_message and message.from_user and connection_id):
+    # Владелец отвечает на чужое медиа — бот присылает его копию в личку
+    r = m.reply_to_message
+    owner = await get_owner(conn)
+    if not (r and owner and m.from_user and m.from_user.id == owner):
         return
-
-    owner_id = await get_user_by_connection(connection_id)
-    if not owner_id or message.from_user.id != owner_id:
+    if r.from_user and r.from_user.id == owner:
         return
-
-    replied = message.reply_to_message
-
-    if replied.from_user and replied.from_user.id == owner_id:
-        return
-
-    media_type = None
-    file_id = None
-
-    if replied.photo:
-        media_type = "photo"
-        file_id = replied.photo[-1].file_id
-    elif replied.video:
-        media_type = "video"
-        file_id = replied.video.file_id
-    elif replied.video_note:
-        media_type = "video_note"
-        file_id = replied.video_note.file_id
-    elif replied.voice:
-        media_type = "voice"
-        file_id = replied.voice.file_id
-    elif replied.document:
-        media_type = "document"
-        file_id = replied.document.file_id
-    elif replied.animation:
-        media_type = "animation"
-        file_id = replied.animation.file_id
-    elif replied.sticker:
-        media_type = "sticker"
-        file_id = replied.sticker.file_id
-
+    kind, file_id = extract_media(r)
     if not file_id:
         return
-
     try:
-        file = await bot.get_file(file_id)
-        file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(file_url) as resp:
-                if resp.status != 200:
-                    await bot.send_message(owner_id, "❌ Не удалось скачать файл")
-                    return
-
-                content = await resp.read()
-
-                ext = {
-                    "photo": ".jpg",
-                    "video": ".mp4",
-                    "animation": ".mp4",
-                    "video_note": ".mp4",
-                    "voice": ".ogg",
-                    "sticker": ".webp",
-                }.get(media_type, ".bin")
-
-                temp_filename = f"temp_{message.message_id}{ext}"
-                with open(temp_filename, "wb") as f:
-                    f.write(content)
-
-                input_file = FSInputFile(temp_filename)
-                caption = (
-                    f"💾 <b>Сохранено</b>\n"
-                    f"От: {replied.from_user.full_name if replied.from_user else 'неизвестно'}"
-                )
-
-                if media_type == "photo":
-                    await bot.send_photo(owner_id, input_file, caption=caption)
-                elif media_type == "video":
-                    await bot.send_video(owner_id, input_file, caption=caption)
-                elif media_type == "voice":
-                    await bot.send_voice(owner_id, input_file, caption=caption)
-                elif media_type == "document":
-                    await bot.send_document(owner_id, input_file, caption=caption)
-                elif media_type == "animation":
-                    await bot.send_animation(owner_id, input_file, caption=caption)
-                elif media_type == "video_note":
-                    await bot.send_video_note(owner_id, input_file)
-                    await bot.send_message(owner_id, caption)
-                elif media_type == "sticker":
-                    await bot.send_sticker(owner_id, input_file)
-                    await bot.send_message(owner_id, caption)
-
-                os.remove(temp_filename)
-
-    except Exception as e:
-        logger.error(f"Save media error: {e}")
-        try:
-            await bot.send_message(owner_id, f"❌ Ошибка: {e}")
-        except Exception:
-            pass
+        buf = io.BytesIO()
+        await bot.download(file_id, destination=buf)
+        name = (r.document.file_name if kind == "document" and r.document.file_name
+                else f"{r.message_id}{EXT.get(kind, '.bin')}")
+        who = esc(r.from_user.full_name) if r.from_user else "неизвестно"
+        await send_media(owner, kind, BufferedInputFile(buf.getvalue(), name),
+                         f"💾 <b>Сохранено</b>\nОт: {who}")
+    except TelegramAPIError as e:
+        log.error("Save media error: %s", e)
+        await bot.send_message(owner, f"❌ Не удалось сохранить файл: {esc(str(e))}")
 
 @dp.edited_business_message()
-async def on_edited_business_message(message: Message):
-    connection_id = message.business_connection_id
-    if not connection_id:
+async def on_edited_business_message(m: Message):
+    conn = m.business_connection_id
+    owner = await get_owner(conn) if conn else None
+    if not owner:
         return
-
-    owner_id = await get_user_by_connection(connection_id)
-    if not owner_id:
+    if not (m.from_user and m.from_user.id != owner):
+        await save_message(m, conn)
         return
-
-    if message.from_user and message.from_user.id == owner_id:
-        await save_message(message, connection_id)
-        return
-
-    old = await get_message(message.chat.id, message.message_id)
-    old_text = old[1] if old else "не сохранено"
-    new_text = message.text or message.caption or "[медиа]"
-    from_user = message.from_user.full_name if message.from_user else "Неизвестно"
-
-    text = (
-        f"✏️ <b>Сообщение отредактировано</b>\n"
-        f"От: {from_user}\n\n"
-        f"<b>Было:</b>\n<code>{old_text}</code>\n\n"
-        f"<b>Стало:</b>\n<code>{new_text}</code>"
-    )
-    await bot.send_message(owner_id, text)
-    await save_message(message, connection_id)
+    old = await fetchone(
+        "SELECT text FROM messages WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+        (conn, m.chat.id, m.message_id))
+    old_text = old[0] if old else "не сохранено"
+    new_text = m.text or m.caption or "[медиа]"
+    await bot.send_message(
+        owner,
+        f"✏️ <b>Сообщение отредактировано</b>\nОт: {esc(m.from_user.full_name)}\n\n"
+        f"<b>Было:</b>\n<code>{esc(clip(old_text))}</code>\n\n"
+        f"<b>Стало:</b>\n<code>{esc(clip(new_text))}</code>")
+    await save_message(m, conn)
 
 @dp.deleted_business_messages()
-async def on_deleted_business_messages(event: BusinessMessagesDeleted):
-    connection_id = event.business_connection_id
-    if not connection_id:
+async def on_deleted_business_messages(e: BusinessMessagesDeleted):
+    conn = e.business_connection_id
+    owner = await get_owner(conn) if conn else None
+    if not owner:
         return
-
-    owner_id = await get_user_by_connection(connection_id)
-    if not owner_id:
-        return
-
-    for msg_id in event.message_ids:
-        saved = await get_message(event.chat.id, msg_id)
-
-        if saved:
-            name, text, media_type, file_id, _ = saved
-            notify = (
-                f"🗑 <b>Сообщение удалено</b>\n"
-                f"От: {name}\n\n"
-                f"<b>Текст:</b>\n<code>{text or '[без текста]'}</code>"
-            )
-            await bot.send_message(owner_id, notify)
-
-            if file_id and media_type:
-                try:
-                    if media_type == "photo":
-                        await bot.send_photo(owner_id, file_id, caption="📷 Восстановленное фото")
-                    elif media_type == "video":
-                        await bot.send_video(owner_id, file_id, caption="🎬 Восстановленное видео")
-                    elif media_type == "voice":
-                        await bot.send_voice(owner_id, file_id, caption="🎤 Восстановленное голосовое")
-                    elif media_type == "document":
-                        await bot.send_document(owner_id, file_id, caption="📄 Восстановленный файл")
-                    elif media_type == "video_note":
-                        await bot.send_video_note(owner_id, file_id)
-                    elif media_type == "sticker":
-                        await bot.send_sticker(owner_id, file_id)
-                    elif media_type == "animation":
-                        await bot.send_animation(owner_id, file_id, caption="🎞️ Восстановленная анимация")
-                except Exception as e:
-                    logger.warning(f"Не удалось отправить медиа: {e}")
-        else:
+    for msg_id in e.message_ids:
+        row = await fetchone(
+            "SELECT from_user_name, text, media_type, file_id FROM messages "
+            "WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+            (conn, e.chat.id, msg_id))
+        if not row:
             await bot.send_message(
-                owner_id,
-                f"🗑 Удалено сообщение (id <code>{msg_id}</code>), оригинал не был сохранён."
-            )
+                owner, f"🗑 Удалено сообщение (id <code>{msg_id}</code>), оригинал не был сохранён.")
+            continue
+        name, text, kind, file_id = row
+        await bot.send_message(
+            owner, f"🗑 <b>Сообщение удалено</b>\nОт: {esc(name)}\n\n"
+                   f"<b>Текст:</b>\n<code>{esc(clip(text or '[без текста]'))}</code>")
+        if kind and file_id:
+            try:
+                await send_media(owner, kind, file_id, "♻️ Восстановленное медиа")
+            except TelegramAPIError as err:
+                log.warning("Не удалось отправить медиа: %s", err)
+    await db.executemany(
+        "UPDATE messages SET deleted = 1 WHERE connection_id = ? AND chat_id = ? AND message_id = ?",
+        [(conn, e.chat.id, i) for i in e.message_ids])
+    await db.commit()
+
+# ==================== API ДЛЯ MINI APP ====================
+
+def auth(request: web.Request) -> int:
+    """Проверяет подпись initData от Telegram и возвращает id пользователя."""
+    try:
+        data = safe_parse_webapp_init_data(BOT_TOKEN, request.headers.get("X-Init-Data", ""))
+    except ValueError:
+        raise web.HTTPUnauthorized()
+    if not data.user or time.time() - data.auth_date.timestamp() > 86400:
+        raise web.HTTPUnauthorized()
+    return data.user.id
+
+def qint(request: web.Request, key: str, default: int | None = None) -> int:
+    try:
+        return int(request.query[key])
+    except (KeyError, ValueError):
+        if default is None:
+            raise web.HTTPBadRequest()
+        return default
+
+async def find_message(uid: int, chat: int, msg_id: int):
+    row = await fetchone(
+        f"SELECT media_type, file_id FROM messages "
+        f"WHERE chat_id = ? AND message_id = ? AND {OWNED} AND file_id IS NOT NULL",
+        (chat, msg_id, uid))
+    if not row:
+        raise web.HTTPNotFound()
+    return row
+
+async def api_index(_):
+    return web.FileResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
+
+async def api_chats(request: web.Request):
+    uid = auth(request)
+    rows = await fetchall(f"""
+        WITH mine AS (SELECT * FROM messages WHERE {OWNED}),
+        ranked AS (
+            SELECT *, ROW_NUMBER() OVER (PARTITION BY chat_id ORDER BY date DESC, message_id DESC) AS rn,
+                   COUNT(*) OVER (PARTITION BY chat_id) AS n,
+                   SUM(deleted) OVER (PARTITION BY chat_id) AS gone
+            FROM mine)
+        SELECT r.chat_id, COALESCE(c.title, r.from_user_name), r.n, r.gone, r.date,
+               COALESCE(NULLIF(r.text, ''), '[' || r.media_type || ']', '')
+        FROM ranked r LEFT JOIN chats c
+             ON c.chat_id = r.chat_id AND c.connection_id = r.connection_id
+        WHERE r.rn = 1 ORDER BY r.date DESC""", (uid,))
+    return web.json_response([
+        {"id": i, "title": t, "count": n, "deleted": g, "date": d, "preview": p[:90]}
+        for i, t, n, g, d, p in rows])
+
+async def api_history(request: web.Request):
+    uid = auth(request)
+    chat, before = qint(request, "chat"), qint(request, "before", 2**62)
+    limit = 50
+    rows = await fetchall(f"""
+        SELECT message_id, from_user_id, text, media_type, date, edited, deleted
+        FROM messages WHERE chat_id = ? AND message_id < ? AND {OWNED}
+        ORDER BY message_id DESC LIMIT ?""", (chat, before, uid, limit))
+    items = [{"id": i, "from": f, "text": t, "media": k, "date": d, "edited": e, "deleted": x}
+             for i, f, t, k, d, e, x in reversed(rows)]
+    return web.json_response({"owner": uid, "items": items, "has_more": len(rows) == limit})
+
+async def api_media(request: web.Request):
+    uid = auth(request)
+    kind, file_id = await find_message(uid, qint(request, "chat"), qint(request, "id"))
+    buf = io.BytesIO()
+    try:
+        await bot.download(file_id, destination=buf)
+    except TelegramAPIError:  # например, файл больше 20 МБ
+        raise web.HTTPNotFound()
+    return web.Response(body=buf.getvalue(), content_type=MIME.get(kind, "application/octet-stream"),
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+async def api_resend(request: web.Request):
+    uid = auth(request)
+    kind, file_id = await find_message(uid, qint(request, "chat"), qint(request, "id"))
+    try:
+        await send_media(uid, kind, file_id)
+    except TelegramAPIError:
+        raise web.HTTPBadGateway()
+    return web.json_response({"ok": True})
+
+AVATARS: dict[int, bytes | None] = {}
+
+async def api_avatar(request: web.Request):
+    uid = auth(request)
+    chat = qint(request, "chat")
+    if not await fetchone(f"SELECT 1 FROM messages WHERE chat_id = ? AND {OWNED} LIMIT 1", (chat, uid)):
+        raise web.HTTPNotFound()
+    if chat not in AVATARS:
+        data = None
+        try:  # для Business-чатов фото часто недоступно — тогда в приложении будут инициалы
+            info = await bot.get_chat(chat)
+            if info.photo:
+                buf = io.BytesIO()
+                await bot.download(info.photo.small_file_id, destination=buf)
+                data = buf.getvalue()
+        except TelegramAPIError:
+            pass
+        AVATARS[chat] = data
+    if not AVATARS[chat]:
+        raise web.HTTPNotFound()
+    return web.Response(body=AVATARS[chat], content_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+def make_web_app() -> web.Application:
+    app = web.Application()
+    app.add_routes([
+        web.get("/", api_index), web.get("/api/chats", api_chats),
+        web.get("/api/history", api_history), web.get("/api/media", api_media),
+        web.get("/api/avatar", api_avatar), web.post("/api/resend", api_resend)])
+    return app
 
 # ==================== ЗАПУСК ====================
 
 async def main():
-    await init_db()
-    logger.info("Мультипользовательский бот запускается...")
-    await dp.start_polling(bot)
+    global db
+    db = await aiosqlite.connect(DB_PATH)
+    await db.execute("PRAGMA journal_mode = WAL")
+    await db.execute("PRAGMA synchronous = NORMAL")
+    await db.executescript(SCHEMA)
+
+    runner = web.AppRunner(make_web_app())
+    await runner.setup()
+    await web.TCPSite(runner, WEB_HOST, WEB_PORT).start()
+    log.info("Web: http://%s:%s", WEB_HOST, WEB_PORT)
+
+    if WEBAPP_URL:  # кнопка меню слева от поля ввода
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(
+            text="История", web_app=WebAppInfo(url=WEBAPP_URL)))
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await runner.cleanup()
+        await db.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

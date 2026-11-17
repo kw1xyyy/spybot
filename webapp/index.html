@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>История чатов</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-bg-color,#fff); --fg:var(--tg-theme-text-color,#111);
+  --hint:var(--tg-theme-hint-color,#707579); --sec:var(--tg-theme-secondary-bg-color,#f1f2f5);
+  --accent:var(--tg-theme-button-color,#3390ec); --danger:#e5484d;
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-text-size-adjust:100%}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;text-align:left;cursor:pointer}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+[hidden]{display:none!important}
+
+.ava{flex:none;width:48px;height:48px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:600;font-size:18px;overflow:hidden}
+.ava.sm{width:34px;height:34px;font-size:14px}
+.ava img{width:100%;height:100%;object-fit:cover;display:block}
+
+#q{display:block;width:calc(100% - 24px);margin:10px 12px;padding:10px 14px;border:0;border-radius:12px;background:var(--sec);color:var(--fg);font:inherit}
+.row{display:flex;gap:12px;width:100%;padding:8px 14px;align-items:center}
+.row:active{background:var(--sec)}
+.mid{flex:1;min-width:0}
+.top,.bot{display:flex;gap:8px;align-items:baseline;justify-content:space-between}
+.title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.time{color:var(--hint);font-size:13px;flex:none}
+.prev{color:var(--hint);font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tags{display:flex;gap:6px;flex:none;font-size:12px}
+.count{background:var(--sec);color:var(--hint);border-radius:10px;padding:0 7px}
+.gone{background:color-mix(in srgb,var(--danger) 16%,var(--bg));color:var(--danger);border-radius:10px;padding:0 7px}
+.empty{color:var(--hint);text-align:center;padding:48px 28px;margin:0}
+
+#head{position:sticky;top:0;z-index:2;display:flex;gap:10px;align-items:center;padding:8px 14px;background:var(--bg);border-bottom:1px solid var(--sec)}
+#more{display:block;margin:12px auto;padding:8px 16px;border-radius:14px;background:var(--sec);color:var(--accent)}
+#msgs{display:flex;flex-direction:column;gap:4px;padding:6px 12px 24px}
+.day{align-self:center;margin:10px 0 4px;padding:2px 12px;border-radius:12px;background:var(--sec);color:var(--hint);font-size:13px}
+.msg{max-width:82%;padding:7px 11px 5px;border-radius:16px;background:var(--sec);overflow-wrap:anywhere}
+.msg.in{align-self:flex-start;border-bottom-left-radius:5px}
+.msg.out{align-self:flex-end;border-bottom-right-radius:5px;background:color-mix(in srgb,var(--accent) 20%,var(--bg))}
+.msg.del{border-left:3px solid var(--danger);background:color-mix(in srgb,var(--danger) 10%,var(--bg))}
+.txt{white-space:pre-wrap}
+.meta{display:flex;gap:8px;justify-content:flex-end;margin-top:2px;font-size:12px;color:var(--hint)}
+.meta .flag{color:var(--danger)}
+.msg img.photo,.msg video{display:block;max-width:100%;border-radius:10px;margin-bottom:4px;min-height:80px;background:var(--bg)}
+.msg img.sticker{width:140px;display:block}
+.msg audio{max-width:100%}
+.ph{display:block;width:100%;margin-bottom:4px;padding:12px;border-radius:10px;background:var(--bg);color:var(--accent);font-size:14px}
+</style>
+</head>
+<body>
+<section id="list">
+  <input id="q" type="search" placeholder="Поиск по чатам" autocomplete="off">
+  <div id="items"></div>
+</section>
+<section id="chat" hidden>
+  <div id="head"></div>
+  <button id="more" hidden>Показать ещё</button>
+  <div id="msgs"></div>
+</section>
+
+<script>
+const tg = window.Telegram.WebApp;
+tg.ready(); tg.expand();
+
+const $ = s => document.querySelector(s);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+};
+const headers = () => ({ 'X-Init-Data': tg.initData });
+const get = async url => {
+  const r = await fetch(url, { headers: headers() });
+  if (!r.ok) throw new Error(r.status);
+  return r;
+};
+
+// Файлы просят с заголовком авторизации, поэтому грузим через blob
+const blobs = new Map();
+const blobUrl = url => {
+  if (!blobs.has(url)) {
+    blobs.set(url, get(url).then(r => r.blob()).then(URL.createObjectURL)
+      .catch(e => { blobs.delete(url); throw e; }));
+  }
+  return blobs.get(url);
+};
+
+const watcher = new IntersectionObserver(entries => entries.forEach(e => {
+  if (e.isIntersecting) { watcher.unobserve(e.target); e.target.load(); }
+}), { rootMargin: '300px' });
+const lazy = (node, load) => { node.load = load; watcher.observe(node); return node; };
+
+const hue = s => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) % 360, 7);
+function avatar(chat, title, small) {
+  const initials = title.trim().split(/\s+/).slice(0, 2).map(w => [...w][0]).join('').toUpperCase();
+  const n = el('div', small ? 'ava sm' : 'ava', initials || '?');
+  n.style.background = `hsl(${hue(title)} 50% 46%)`;
+  return lazy(n, async () => {
+    try {
+      const img = el('img');
+      img.src = await blobUrl(`/api/avatar?chat=${chat}`);
+      n.textContent = ''; n.style.background = 'none'; n.append(img);
+    } catch { /* остаются инициалы */ }
+  });
+}
+
+const sameDay = d => d.toDateString() === new Date().toDateString();
+const hm = ts => new Date(ts * 1000).toLocaleTimeString('ru', { hour: '2-digit', minute: '2-digit' });
+const listDate = ts => {
+  const d = new Date(ts * 1000);
+  return sameDay(d) ? hm(ts) : d.toLocaleDateString('ru', { day: '2-digit', month: '2-digit' });
+};
+
+/* ---------- список чатов ---------- */
+let chats = [];
+function renderList() {
+  const q = $('#q').value.trim().toLowerCase();
+  const box = $('#items');
+  box.replaceChildren();
+  const shown = chats.filter(c => c.title.toLowerCase().includes(q));
+  if (!shown.length) {
+    box.append(el('p', 'empty', chats.length
+      ? 'Ничего не найдено'
+      : 'Пока нет сохранённых переписок. Они появятся, как только вам напишут в чате, подключённом к боту.'));
+    return;
+  }
+  for (const c of shown) {
+    const row = el('button', 'row');
+    const top = el('div', 'top');
+    top.append(el('b', 'title', c.title), el('span', 'time', listDate(c.date)));
+    const tags = el('div', 'tags');
+    if (c.deleted) tags.append(el('span', 'gone', `удалено ${c.deleted}`));
+    tags.append(el('span', 'count', c.count));
+    const bottom = el('div', 'bot');
+    bottom.append(el('span', 'prev', c.preview), tags);
+    const mid = el('div', 'mid');
+    mid.append(top, bottom);
+    row.append(avatar(c.id, c.title), mid);
+    row.onclick = () => openChat(c);
+    box.append(row);
+  }
+}
+
+/* ---------- переписка ---------- */
+let cur = null;
+const LABEL = { video: 'Видео', animation: 'GIF', video_note: 'Кружок', voice: 'Голосовое', document: 'Файл', audio: 'Аудио' };
+
+async function resend(m, btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/resend?chat=${cur.chat.id}&id=${m.id}`, { method: 'POST', headers: headers() });
+    if (!r.ok) throw new Error(r.status);
+    btn.textContent = 'Отправлено в чат с ботом';
+  } catch {
+    btn.textContent = 'Не удалось отправить. Нажмите, чтобы повторить';
+    btn.disabled = false;
+  }
+}
+
+function mediaNode(m) {
+  const url = `/api/media?chat=${cur.chat.id}&id=${m.id}`;
+  if (m.media === 'photo' || m.media === 'sticker') {
+    const img = el('img', m.media);
+    return lazy(img, async () => {
+      try { img.src = await blobUrl(url); }
+      catch { img.replaceWith(el('div', 'ph', 'Файл недоступен')); }
+    });
+  }
+  const btn = el('button', 'ph');
+  if (!['video', 'animation', 'video_note', 'voice'].includes(m.media)) {
+    btn.textContent = `${LABEL[m.media] || 'Файл'}: отправить в чат с ботом`;
+    btn.onclick = () => resend(m, btn);
+    return btn;
+  }
+  btn.textContent = `${LABEL[m.media]}: нажмите, чтобы загрузить`;
+  btn.onclick = async () => {
+    btn.textContent = 'Загрузка…';
+    try {
+      const player = el(m.media === 'voice' ? 'audio' : 'video');
+      player.src = await blobUrl(url);
+      player.playsInline = true;
+      if (m.media === 'animation') { player.autoplay = player.loop = player.muted = true; }
+      else player.controls = true;
+      btn.replaceWith(player);
+    } catch {
+      btn.textContent = 'Не получилось загрузить. Отправить в чат с ботом?';
+      btn.onclick = () => resend(m, btn);
+    }
+  };
+  return btn;
+}
+
+function msgNode(m, owner) {
+  const n = el('div', `msg ${m.from === owner ? 'out' : 'in'}${m.deleted ? ' del' : ''}`);
+  n.dataset.day = new Date(m.date * 1000).toLocaleDateString('ru', { day: 'numeric', month: 'long' });
+  if (m.media) n.append(mediaNode(m));
+  if (m.text) n.append(el('div', 'txt', m.text));
+  const meta = el('div', 'meta');
+  if (m.deleted) meta.append(el('span', 'flag', 'удалено'));
+  if (m.edited) meta.append(el('span', '', 'изменено'));
+  meta.append(el('span', '', hm(m.date)));
+  n.append(meta);
+  return n;
+}
+
+function fixDays() {
+  const box = $('#msgs');
+  box.querySelectorAll('.day').forEach(n => n.remove());
+  let last = '';
+  for (const m of box.querySelectorAll('.msg')) {
+    if (m.dataset.day !== last) { last = m.dataset.day; m.before(el('div', 'day', last)); }
+  }
+}
+
+async function loadMore() {
+  const url = `/api/history?chat=${cur.chat.id}` + (cur.oldest ? `&before=${cur.oldest}` : '');
+  const data = await (await get(url)).json();
+  if (!data.items.length) return;
+  const page = document.documentElement;
+  const before = page.scrollHeight;
+  cur.oldest = data.items[0].id;
+  $('#msgs').prepend(...data.items.map(m => msgNode(m, data.owner)));
+  fixDays();
+  $('#more').hidden = !data.has_more;
+  window.scrollTo({ top: cur.first ? page.scrollHeight : page.scrollHeight - before, behavior: 'instant' });
+  cur.first = false;
+}
+
+async function openChat(c) {
+  cur = { chat: c, oldest: null, first: true };
+  $('#list').hidden = true; $('#chat').hidden = false;
+  const head = $('#head');
+  head.replaceChildren(avatar(c.id, c.title, true), el('b', 'title', c.title));
+  $('#msgs').replaceChildren(); $('#more').hidden = true;
+  tg.BackButton.show();
+  try { await loadMore(); } catch { $('#msgs').append(el('p', 'empty', 'Не удалось загрузить историю')); }
+}
+
+function backToList() {
+  tg.BackButton.hide();
+  $('#chat').hidden = true; $('#list').hidden = false;
+  window.scrollTo({ top: 0, behavior: 'instant' });
+}
+
+$('#more').onclick = () => loadMore().catch(() => {});
+$('#q').oninput = renderList;
+tg.BackButton.onClick(backToList);
+
+(async () => {
+  if (!tg.initData) {
+    $('#items').append(el('p', 'empty', 'Откройте это приложение из Telegram: кнопка «История» в чате с ботом.'));
+    return;
+  }
+  try { chats = await (await get('/api/chats')).json(); renderList(); }
+  catch { $('#items').append(el('p', 'empty', 'Не удалось загрузить чаты. Закройте приложение и откройте снова.')); }
+})();
+</script>
+</body>
+</html>
