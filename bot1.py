@@ -4,6 +4,7 @@ import asyncio
 import html
 import io
 import logging
+import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,11 +24,16 @@ from aiohttp import web
 
 import config
 
-BOT_TOKEN = config.BOT_TOKEN
-WEBAPP_URL = getattr(config, "WEBAPP_URL", "").rstrip("/")  # публичный https-адрес
-WEB_HOST = getattr(config, "WEB_HOST", "127.0.0.1")
-WEB_PORT = getattr(config, "WEB_PORT", 8080)
-DB_PATH = "messages.db"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or config.BOT_TOKEN
+# Bothost сам выдаёт DOMAIN и PORT; локально можно задать WEBAPP_URL в config.py
+WEBAPP_URL = (os.getenv("DOMAIN") or getattr(config, "WEBAPP_URL", "")).rstrip("/")
+if WEBAPP_URL and not WEBAPP_URL.startswith("http"):
+    WEBAPP_URL = "https://" + WEBAPP_URL
+WEB_HOST = "0.0.0.0"
+WEB_PORT = int(os.getenv("PORT") or getattr(config, "WEB_PORT", 3000))
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = str(DATA_DIR / "messages.db")
 INDEX_HTML = Path(__file__).parent / "webapp" / "index.html"
 
 logging.basicConfig(level=logging.INFO)
