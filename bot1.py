@@ -452,6 +452,37 @@ def make_web_app() -> web.Application:
         web.get("/api/avatar", api_avatar), web.post("/api/resend", api_resend)])
     return app
 
+# ==================== ПЕРЕНОС СТАРОЙ БАЗЫ ====================
+
+async def migrate_old_db():
+    """Переносит сообщения из old_messages.db (можно запускать повторно, дублей не будет)."""
+    for src in (Path(__file__).parent / "old_messages.db", DATA_DIR / "old_messages.db"):
+        if not src.exists():
+            continue
+        await db.commit()
+        await db.execute("ATTACH DATABASE ? AS old", (str(src),))
+        try:
+            await db.execute("INSERT OR IGNORE INTO connections SELECT connection_id, user_id, "
+                             "user_name, is_enabled, connected_at FROM old.connections")
+            cur = await db.execute("""
+                INSERT OR IGNORE INTO messages (connection_id, chat_id, message_id, from_user_id,
+                    from_user_name, text, media_type, file_id, date)
+                SELECT connection_id, chat_id, message_id, from_user_id, from_user_name,
+                       text, media_type, file_id, date
+                FROM old.messages WHERE connection_id IS NOT NULL""")
+            await db.execute("""
+                INSERT OR IGNORE INTO chats (connection_id, chat_id, title)
+                SELECT m.connection_id, m.chat_id, MAX(m.from_user_name)
+                FROM old.messages m JOIN old.connections c USING (connection_id)
+                WHERE m.from_user_id != c.user_id GROUP BY m.connection_id, m.chat_id""")
+            await db.commit()
+            log.info("Перенесено сообщений из %s: %s", src, cur.rowcount)
+        except Exception as e:
+            log.error("Перенос из %s не удался: %s", src, e)
+            await db.rollback()
+        finally:
+            await db.execute("DETACH DATABASE old")
+
 # ==================== ЗАПУСК ====================
 
 async def main():
@@ -460,6 +491,7 @@ async def main():
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA synchronous = NORMAL")
     await db.executescript(SCHEMA)
+    await migrate_old_db()
 
     runner = web.AppRunner(make_web_app())
     await runner.setup()
