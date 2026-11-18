@@ -22,7 +22,7 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .ava.sm{width:34px;height:34px;font-size:14px}
 .ava img{width:100%;height:100%;object-fit:cover;display:block}
 
-#q{display:block;width:calc(100% - 24px);margin:10px 12px;padding:10px 14px;border:0;border-radius:12px;background:var(--sec);color:var(--fg);font:inherit}
+#q,#cq{display:block;width:calc(100% - 24px);margin:10px 12px;padding:10px 14px;border:0;border-radius:12px;background:var(--sec);color:var(--fg);font:inherit}
 .row{display:flex;gap:12px;width:100%;padding:8px 14px;align-items:center}
 .row:active{background:var(--sec)}
 .mid{flex:1;min-width:0}
@@ -35,8 +35,12 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
 .gone{background:color-mix(in srgb,var(--danger) 16%,var(--bg));color:var(--danger);border-radius:10px;padding:0 7px}
 .empty{color:var(--hint);text-align:center;padding:48px 28px;margin:0}
 
-#head{position:sticky;top:0;z-index:2;display:flex;gap:10px;align-items:center;padding:8px 14px;background:var(--bg);border-bottom:1px solid var(--sec)}
-#more{display:block;margin:12px auto;padding:8px 16px;border-radius:14px;background:var(--sec);color:var(--accent)}
+#bar{position:sticky;top:0;z-index:2;background:var(--bg);border-bottom:1px solid var(--sec)}
+#head{display:flex;gap:10px;align-items:center;padding:8px 14px 0}
+.msg.hit{cursor:pointer}
+.msg.flash{outline:2px solid var(--accent)}
+mark{background:color-mix(in srgb,var(--accent) 35%,transparent);color:inherit;border-radius:3px}
+#more,#newer{display:block;margin:12px auto;padding:8px 16px;border-radius:14px;background:var(--sec);color:var(--accent)}
 #msgs{display:flex;flex-direction:column;gap:4px;padding:6px 12px 24px}
 .day{align-self:center;margin:10px 0 4px;padding:2px 12px;border-radius:12px;background:var(--sec);color:var(--hint);font-size:13px}
 .msg{max-width:82%;padding:7px 11px 5px;border-radius:16px;background:var(--sec);overflow-wrap:anywhere}
@@ -58,9 +62,13 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline
   <div id="items"><p class="empty">Загрузка…</p></div>
 </section>
 <section id="chat" hidden>
-  <div id="head"></div>
+  <div id="bar">
+    <div id="head"></div>
+    <input id="cq" type="search" placeholder="Поиск по сообщениям" autocomplete="off">
+  </div>
   <button id="more" hidden>Показать ещё</button>
   <div id="msgs"></div>
+  <button id="newer" hidden>Показать новее</button>
 </section>
 
 <script>
@@ -209,11 +217,30 @@ function mediaNode(m) {
   return btn;
 }
 
+function textNode(t) {
+  const d = el('div', 'txt');
+  const q = cur.q ? cur.q.toLowerCase() : '';
+  if (!q) { d.textContent = t; return d; }
+  const low = t.toLowerCase();
+  let i = 0, j;
+  while ((j = low.indexOf(q, i)) !== -1) {
+    d.append(t.slice(i, j), el('mark', '', t.slice(j, j + q.length)));
+    i = j + q.length;
+  }
+  d.append(t.slice(i));
+  return d;
+}
+
 function msgNode(m, owner) {
   const n = el('div', `msg ${m.from === owner ? 'out' : 'in'}${m.deleted ? ' del' : ''}`);
+  n.dataset.id = m.id;
+  if (cur.q) {
+    n.classList.add('hit');
+    n.onclick = ev => { if (!ev.target.closest('button,audio,video')) jumpTo(m.id); };
+  }
   n.dataset.day = new Date(m.date * 1000).toLocaleDateString('ru', { day: 'numeric', month: 'long' });
   if (m.media) n.append(mediaNode(m));
-  if (m.text) n.append(el('div', 'txt', m.text));
+  if (m.text) n.append(textNode(m.text));
   const meta = el('div', 'meta');
   if (m.deleted) meta.append(el('span', 'flag', 'удалено'));
   if (m.edited) meta.append(el('span', '', 'изменено'));
@@ -232,12 +259,20 @@ function fixDays() {
 }
 
 async function loadMore() {
-  const url = `/api/history?chat=${cur.chat.id}` + (cur.oldest ? `&before=${cur.oldest}` : '');
+  const seq = cur.seq;
+  const url = `/api/history?chat=${cur.chat.id}` + (cur.oldest ? `&before=${cur.oldest}` : '')
+    + (cur.q ? `&q=${encodeURIComponent(cur.q)}` : '');
   const data = await (await get(url)).json();
-  if (!data.items.length) return;
+  if (seq !== cur.seq) return;
+  if (!data.items.length) {
+    $('#more').hidden = true;
+    if (cur.q && !cur.oldest) $('#msgs').append(el('p', 'empty', 'Ничего не найдено'));
+    return;
+  }
   const page = document.documentElement;
   const before = page.scrollHeight;
   cur.oldest = data.items[0].id;
+  if (!cur.newest) cur.newest = data.items.at(-1).id;
   $('#msgs').prepend(...data.items.map(m => msgNode(m, data.owner)));
   fixDays();
   $('#more').hidden = !data.has_more;
@@ -245,8 +280,40 @@ async function loadMore() {
   cur.first = false;
 }
 
+async function jumpTo(id) {
+  cur.q = ''; $('#cq').value = ''; cur.seq++;
+  const seq = cur.seq;
+  $('#msgs').replaceChildren(); $('#more').hidden = true; $('#newer').hidden = true;
+  try {
+    const data = await (await get(`/api/history?chat=${cur.chat.id}&around=${id}`)).json();
+    if (seq !== cur.seq) return;
+    cur.oldest = data.items[0].id; cur.newest = data.items.at(-1).id; cur.first = false;
+    $('#msgs').append(...data.items.map(m => msgNode(m, data.owner)));
+    fixDays();
+    $('#more').hidden = !data.has_more; $('#newer').hidden = !data.has_newer;
+    const target = $('#msgs').querySelector(`[data-id="${id}"]`);
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+      target.classList.add('flash');
+      setTimeout(() => target.classList.remove('flash'), 1800);
+    }
+  } catch (err) { $('#msgs').append(el('p', 'empty', 'Не удалось перейти к сообщению: ' + err.message)); }
+}
+
+async function loadNewer() {
+  const seq = cur.seq;
+  const data = await (await get(`/api/history?chat=${cur.chat.id}&after=${cur.newest}`)).json();
+  if (seq !== cur.seq || !data.items.length) { $('#newer').hidden = true; return; }
+  cur.newest = data.items.at(-1).id;
+  $('#msgs').append(...data.items.map(m => msgNode(m, data.owner)));
+  fixDays();
+  $('#newer').hidden = !data.has_newer;
+}
+
 async function openChat(c) {
-  cur = { chat: c, oldest: null, first: true };
+  cur = { chat: c, oldest: null, newest: null, first: true, q: '', seq: 0 };
+  $('#newer').hidden = true;
+  $('#cq').value = '';
   $('#list').hidden = true; $('#chat').hidden = false;
   const head = $('#head');
   head.replaceChildren(avatar(c.id, c.title, true), el('b', 'title', c.title));
@@ -262,6 +329,17 @@ function backToList() {
 }
 
 $('#more').onclick = () => loadMore().catch(() => {});
+$('#newer').onclick = () => loadNewer().catch(() => {});
+let searchTimer;
+$('#cq').oninput = e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    cur.q = e.target.value.trim(); cur.oldest = null; cur.newest = null; cur.first = true; cur.seq++;
+    $('#msgs').replaceChildren(); $('#more').hidden = true; $('#newer').hidden = true;
+    try { await loadMore(); }
+    catch (err) { $('#msgs').append(el('p', 'empty', 'Ошибка поиска: ' + err.message)); }
+  }, 300);
+};
 $('#q').oninput = renderList;
 tg.BackButton.onClick(backToList);
 
