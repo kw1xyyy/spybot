@@ -391,15 +391,37 @@ async def api_chats(request: web.Request):
 
 async def api_history(request: web.Request):
     uid = auth(request)
-    chat, before = qint(request, "chat"), qint(request, "before", 2**62)
-    limit = 50
-    rows = await fetchall(f"""
-        SELECT message_id, from_user_id, text, media_type, date, edited, deleted
-        FROM messages WHERE chat_id = ? AND message_id < ? AND {OWNED}
-        ORDER BY message_id DESC LIMIT ?""", (chat, before, uid, limit))
+    chat, limit = qint(request, "chat"), 50
+    cols = "SELECT message_id, from_user_id, text, media_type, date, edited, deleted FROM messages"
+    has_newer = False
+    if "around" in request.query or "after" in request.query:
+        # around=<id>: окно вокруг сообщения; after=<id>: следующая порция более новых
+        around = "around" in request.query
+        mid = qint(request, "around" if around else "after")
+        size = limit // 2 if around else limit
+        newer = await fetchall(
+            f"{cols} WHERE chat_id = ? AND {OWNED} AND message_id > ? ORDER BY message_id LIMIT ?",
+            (chat, uid, mid, size + 1))
+        has_newer, newer = len(newer) > size, newer[:size]
+        older = await fetchall(
+            f"{cols} WHERE chat_id = ? AND {OWNED} AND message_id <= ? "
+            f"ORDER BY message_id DESC LIMIT ?", (chat, uid, mid, size)) if around else []
+        rows, has_more = [*reversed(older), *newer], bool(around and len(older) == size)
+    else:
+        before = qint(request, "before", 2**62)
+        extra, args = "", [chat, before, uid]
+        q = request.query.get("q", "").strip().lower()
+        if q:
+            extra = " AND pylower(text) LIKE ? ESCAPE '\\'"
+            args.append("%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+        recent = await fetchall(
+            f"{cols} WHERE chat_id = ? AND message_id < ? AND {OWNED}{extra} "
+            f"ORDER BY message_id DESC LIMIT ?", (*args, limit))
+        rows, has_more = list(reversed(recent)), len(recent) == limit
     items = [{"id": i, "from": f, "text": t, "media": k, "date": d, "edited": e, "deleted": x}
-             for i, f, t, k, d, e, x in reversed(rows)]
-    return web.json_response({"owner": uid, "items": items, "has_more": len(rows) == limit})
+             for i, f, t, k, d, e, x in rows]
+    return web.json_response({"owner": uid, "items": items, "has_more": has_more,
+                              "has_newer": has_newer})
 
 async def api_media(request: web.Request):
     uid = auth(request)
@@ -490,6 +512,7 @@ async def main():
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA synchronous = NORMAL")
     await db.executescript(SCHEMA)
+    await db.create_function("pylower", 1, lambda s: s.lower() if s else "", deterministic=True)
     await migrate_old_db()
 
     runner = web.AppRunner(make_web_app())
